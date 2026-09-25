@@ -991,6 +991,61 @@ const MockApi = (function() {
         };
       }
 
+      if (accion === 'actualizarReporte') {
+        const resultados = obtenerColeccion(STORAGE_KEYS.RESULTADOS);
+        const documentos = obtenerColeccion(STORAGE_KEYS.DOCUMENTOS);
+        const bitacora = obtenerColeccion(STORAGE_KEYS.BITACORA);
+
+        const rItem = resultados.find(r => String(r.id) === String(datos.id));
+        if (!rItem) throw new Error('Reporte no encontrado.');
+
+        const emailAutor = String(rItem.email || '').toLowerCase().trim();
+        const emailActual = String(usuarioActual?.email || '').toLowerCase().trim();
+        if (emailAutor !== emailActual) {
+          throw new Error('Ningún usuario puede editar el resultado reportado por otro usuario.');
+        }
+
+        if (datos.resultado) rItem.resultado = datos.resultado;
+        if (datos.paso !== undefined) rItem.paso = datos.paso;
+        if (datos.comentario !== undefined) rItem.comentario = datos.comentario;
+        if (datos.documentosTexto !== undefined) rItem.documentos = datos.documentosTexto;
+        guardarColeccion(STORAGE_KEYS.RESULTADOS, resultados);
+
+
+        if (Array.isArray(datos.nuevosDocumentos) && datos.nuevosDocumentos.length > 0) {
+          const nuevos = datos.nuevosDocumentos.map((d, idx) => ({
+            id: 'D-SIM-' + (documentos.length + idx + 1),
+            resultado_id: datos.id,
+            tipo: d.tipo,
+            numero: String(d.numero || '').trim(),
+            sociedad: d.sociedad || 'CL11',
+            ejercicio: d.ejercicio || 2026,
+            tipo_objeto: datos.tipo || 'CU',
+            objeto: datos.objeto || '',
+            paso: d.paso || null,
+            email: usuarioActual ? usuarioActual.email : '',
+            ts: new Date().toISOString().replace('T', ' ').substring(0, 19),
+            ciclo: config.ciclo_activo,
+            golive: config.golive_activo
+          }));
+          documentos.push(...nuevos);
+          guardarColeccion(STORAGE_KEYS.DOCUMENTOS, documentos);
+        }
+
+        bitacora.push({
+          ts: new Date().toISOString().replace('T', ' ').substring(0, 19),
+          usuario: usuarioActual ? usuarioActual.email : '',
+          accion: 'actualizarReporte',
+          objeto: datos.id,
+          detalle: 'Reporte editado e información adicional incorporada',
+          ip: 'simulado'
+        });
+        guardarColeccion(STORAGE_KEYS.BITACORA, bitacora);
+
+        return { ok: true, id: datos.id };
+      }
+
+
       if (accion === 'buscarDocumento') {
         const numero = String(datos.numero || '').trim().toLowerCase();
         const documentos = obtenerColeccion(STORAGE_KEYS.DOCUMENTOS);
@@ -1094,6 +1149,10 @@ const AppState = {
   modalAgregarDocAbierto: false,
   modalIncidenciaAbierto: false,
   incidenciaEnGestion: null,
+  modalEditarReporteAbierto: false,
+  reporteEnEdicion: null,
+  guardandoEdicionReporte: false,
+  edicionNuevosDocs: [],
   cargando: false,
   busquedaDocResultados: null,
   filtroGestionArea: 'todas',
@@ -1464,6 +1523,7 @@ function renderizarApp() {
     ${AppState.modalReporteAbierto ? renderizarModalReportar() : ''}
     ${AppState.modalAgregarDocAbierto ? renderizarModalAgregarDoc() : ''}
     ${AppState.modalIncidenciaAbierto ? renderizarModalGestionIncidencia() : ''}
+    ${AppState.modalEditarReporteAbierto ? renderizarModalEditarReporte() : ''}
   `;
 
   enlazarEventosGlobales();
@@ -1638,6 +1698,72 @@ function usuarioPerteneceAArea(email, areaKey) {
   return false;
 }
 
+/**
+ * Determina si una prueba corresponde al ámbito de asignación del usuario.
+ * - LIDER: acceso a todo.
+ * - EQUIPO_PROYECTO: Casos Unitarios de sus módulos (o todos los CU si no tiene módulo restrictivo).
+ * - KEY_USER: Escenarios E2E donde sus áreas participan, o CU de sus módulos.
+ */
+function esPruebaAsignadaAUsuario(item, perfil) {
+  if (!item || !perfil) return false;
+  if (perfil.rol === 'LIDER') return true;
+
+  const emailLower = String(perfil.email || '').trim().toLowerCase();
+  const modulosUser = (perfil.modulos || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+  const areasUser = (perfil.areas || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+
+  if (perfil.rol === 'EQUIPO_PROYECTO') {
+    if (item._tipo === 'CU') {
+      if (modulosUser.length > 0) {
+        return modulosUser.includes(String(item.modulo).toUpperCase());
+      }
+      return true;
+    }
+    if (item._tipo === 'E2E' && areasUser.length > 0) {
+      const itemAreas = (item.areas || []).map(a => String(a).toUpperCase());
+      return itemAreas.some(a => areasUser.includes(a));
+    }
+    return false;
+  }
+
+  // KEY_USER
+  if (item._tipo === 'E2E') {
+    const itemAreas = (item.areas || []).map(a => String(a).toUpperCase());
+    return itemAreas.some(area => usuarioPerteneceAArea(emailLower, area));
+  } else if (item._tipo === 'CU') {
+    if (modulosUser.length > 0) {
+      return modulosUser.includes(String(item.modulo).toUpperCase());
+    }
+    return false;
+  }
+
+  return false;
+}
+
+/**
+ * Obtiene el reporte más reciente realizado por el usuario específico para esta prueba.
+ * Si el usuario aún no la ha ejecutado, retorna null (estado PENDIENTE para este usuario).
+ */
+function obtenerResultadoVigenteUsuario(codigo, perfil) {
+  if (!perfil) return null;
+  const emailNorm = String(perfil.email || '').toLowerCase().trim();
+  const hist = AppState.historialPorObjeto.get(codigo) || [];
+
+  // Si es Líder y está en vista global 'todas', retorna el último resultado general
+  if (perfil.rol === 'LIDER' && AppState.subvistaPruebas === 'todas') {
+    return AppState.resultadosVigentes.get(codigo) || null;
+  }
+
+  // Buscar cronológicamente el último reporte de este usuario
+  for (let i = hist.length - 1; i >= 0; i--) {
+    if (String(hist[i].email || '').toLowerCase().trim() === emailNorm) {
+      return hist[i];
+    }
+  }
+
+  return null;
+}
+
 /* ==========================================================================
    PANTALLA 2: MIS PRUEBAS / TODAS LAS PRUEBAS (§8.2)
    ========================================================================== */
@@ -1649,28 +1775,16 @@ function obtenerPruebasFiltradas() {
   const todas = [...cu, ...e2e];
 
   const perfil = AppState.sesion.perfil;
-  const areasUser = (perfil.areas || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
-  const modulosUser = (perfil.modulos || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
-
   const CODIGOS_SIN_DOTACION = ['E2E-06', 'E2E-07', 'E2E-09', 'E2E-10'];
   const SOCIEDADES_SIN_DOTACION = ['CL15', 'CL16'];
 
   return todas.filter(item => {
-    // 1. Selector de dos posiciones: Mis pruebas vs Todas
-    if (AppState.subvistaPruebas === 'mis' && perfil.rol !== 'LIDER') {
-      if (item._tipo === 'CU') {
-        if (perfil.rol === 'KEY_USER' && areasUser.length > 0) {
-          return false;
-        }
-        if (modulosUser.length > 0 && !modulosUser.includes(String(item.modulo).toUpperCase())) {
-          return false;
-        }
-      } else if (item._tipo === 'E2E') {
-        if (areasUser.length > 0) {
-          const itemAreas = (item.areas || []).map(a => String(a).toUpperCase());
-          const coincide = itemAreas.some(a => areasUser.includes(a));
-          if (!coincide) return false;
-        }
+    // 1. Cada usuario debe poder ver únicamente sus propias pruebas (salvo Líder en vista 'todas')
+    if (perfil.rol !== 'LIDER') {
+      if (!esPruebaAsignadaAUsuario(item, perfil)) return false;
+    } else {
+      if (AppState.subvistaPruebas === 'mis' && !esPruebaAsignadaAUsuario(item, perfil)) {
+        return false;
       }
     }
 
@@ -1679,9 +1793,9 @@ function obtenerPruebasFiltradas() {
       if (AppState.filtros.tipo.toUpperCase() !== item._tipo) return false;
     }
 
-    // 3. Filtro de estado
-    const estadoVigente = AppState.resultadosVigentes.get(item._codigo);
-    const estadoActual = estadoVigente ? estadoVigente.resultado : 'PENDIENTE';
+    // 3. Filtro de estado según el reporte propio del usuario
+    const rPropio = obtenerResultadoVigenteUsuario(item._codigo, perfil);
+    const estadoActual = rPropio ? rPropio.resultado : 'PENDIENTE';
     if (AppState.filtros.estado !== 'todos') {
       if (AppState.filtros.estado !== estadoActual) return false;
     }
@@ -1735,22 +1849,20 @@ function obtenerPruebasFiltradas() {
 
     return true;
   }).sort((a, b) => {
-    const estA = AppState.resultadosVigentes.get(a._codigo)?.resultado || 'PENDIENTE';
-    const estB = AppState.resultadosVigentes.get(b._codigo)?.resultado || 'PENDIENTE';
-    const peso = { 'PENDIENTE': 1, 'NOK': 2, 'BLOQUEADO': 3, 'OK': 4, 'NO_APLICA': 5 };
-    const diff = (peso[estA] || 9) - (peso[estB] || 9);
-    if (diff !== 0) return diff;
-    return a._codigo.localeCompare(b._codigo);
+    return a._codigo.localeCompare(b._codigo, undefined, { numeric: true, sensitivity: 'base' });
   });
 }
 
 function renderizarPantallaPruebas() {
   const pruebas = obtenerPruebasFiltradas();
   const perfil = AppState.sesion.perfil;
+  const esLider = esLiderOAdmin();
+  const emailActual = String(AppState.sesion?.usuario || perfil.email || '').toLowerCase().trim();
 
   let cntOK = 0, cntNOK = 0, cntBloq = 0, cntNA = 0, cntPend = 0;
   pruebas.forEach(p => {
-    const est = AppState.resultadosVigentes.get(p._codigo)?.resultado || 'PENDIENTE';
+    const rPropio = obtenerResultadoVigenteUsuario(p._codigo, perfil);
+    const est = rPropio ? rPropio.resultado : 'PENDIENTE';
     if (est === 'OK') cntOK++;
     else if (est === 'NOK') cntNOK++;
     else if (est === 'BLOQUEADO') cntBloq++;
@@ -1767,20 +1879,30 @@ function renderizarPantallaPruebas() {
   return `
     <div class="panel-control-pruebas">
       <div class="fila-selector-alcance">
-        <div class="selector-alcance">
-          <button class="btn-alcance ${AppState.subvistaPruebas === 'mis' ? 'activo' : ''}" id="btn-switch-mis">
-            Mis pruebas
-          </button>
-          <button class="btn-alcance ${AppState.subvistaPruebas === 'todas' ? 'activo' : ''}" id="btn-switch-todas">
-            Todas las pruebas (320)
-          </button>
-        </div>
-
-        <div class="resumen-alcance-info">
-          ${AppState.subvistaPruebas === 'mis' 
-            ? `Mostrando su asignacion predeterminada (${perfil.areas || perfil.modulos || 'Todo'})`
-            : 'Mostrando las 320 pruebas del plan. Puede reportar cualquiera; fuera de su area se marcara como APOYO.'}
-        </div>
+        ${esLider ? `
+          <div class="selector-alcance">
+            <button class="btn-alcance ${AppState.subvistaPruebas === 'mis' ? 'activo' : ''}" id="btn-switch-mis">
+              Mis pruebas
+            </button>
+            <button class="btn-alcance ${AppState.subvistaPruebas === 'todas' ? 'activo' : ''}" id="btn-switch-todas">
+              Todas las pruebas (320)
+            </button>
+          </div>
+          <div class="resumen-alcance-info">
+            ${AppState.subvistaPruebas === 'mis' 
+              ? `Mostrando su asignación predeterminada (${perfil.areas || perfil.modulos || 'Todo'})`
+              : 'Mostrando las 320 pruebas del plan (Vista Global de Líder).'}
+          </div>
+        ` : `
+          <div class="selector-alcance">
+            <button class="btn-alcance activo" style="cursor: default;">
+              Mis pruebas asignadas (${total})
+            </button>
+          </div>
+          <div class="resumen-alcance-info">
+            Mostrando exclusivamente sus pruebas asignadas (${perfil.areas || perfil.modulos || perfil.departamento || 'Ámbito individual'}).
+          </div>
+        `}
 
         <div>
           <button class="btn-certificar-rapido" onclick="window.location.hash='#certificado'" title="Generar y descargar documento resumen de pruebas en PDF">
@@ -1869,7 +1991,7 @@ function renderizarPantallaPruebas() {
           <input type="text" id="filtro-texto" class="form-input" placeholder="Codigo, transaccion, nombre..." value="${AppState.filtros.texto}">
         </div>
 
-        ${AppState.subvistaPruebas === 'todas' ? `
+        ${esLider && AppState.subvistaPruebas === 'todas' ? `
           <label class="filtro-check" title="Muestra pruebas de areas o sociedades que carecen de Key-User nominal">
             <input type="checkbox" id="check-sin-dotacion" ${AppState.filtros.sin_dotacion ? 'checked' : ''}>
             Sin dotacion
@@ -1883,36 +2005,32 @@ function renderizarPantallaPruebas() {
       <table class="tabla-pruebas">
         <thead>
           <tr>
-            <th style="width: 110px;">Codigo</th>
+            <th style="width: 100px;">Codigo</th>
             <th>Nombre / Descripcion</th>
-            <th style="width: 110px;">Estado</th>
-            <th style="width: 80px;">Modulo</th>
-            <th style="width: 140px;">Area / Macro</th>
+            <th style="width: 105px;">Estado</th>
+            <th style="width: 75px;">Modulo</th>
+            <th style="width: 130px;">Area / Macro</th>
             <th style="width: 140px;">Ultimo Reporte</th>
-            <th style="width: 70px;">Docs</th>
+            <th style="width: 60px; text-align: center;">Docs</th>
+            <th style="width: 90px; text-align: center;">Acción</th>
           </tr>
         </thead>
         <tbody>
           ${pruebas.length === 0 ? `
             <tr>
-              <td colspan="7" style="text-align: center; padding: 24px; color: var(--texto-atenuado);">
+              <td colspan="8" style="text-align: center; padding: 24px; color: var(--texto-atenuado);">
                 No se encontraron pruebas con los filtros seleccionados.
               </td>
             </tr>
           ` : pruebas.map(item => {
-            const vig = AppState.resultadosVigentes.get(item._codigo);
+            const rPropio = obtenerResultadoVigenteUsuario(item._codigo, perfil);
+            const vig = rPropio || (esLider && AppState.subvistaPruebas === 'todas' ? AppState.resultadosVigentes.get(item._codigo) : null);
             const estado = vig ? vig.resultado : 'PENDIENTE';
-            const docsCount = (AppState.documentosPorObjeto.get(item._codigo) || []).length;
-            
-            let esDelUsuario = true;
-            if (item._tipo === 'E2E') {
-              const itemAreas = (item.areas || []).map(a => String(a).toUpperCase());
-              const userAreas = (perfil.areas || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
-              if (userAreas.length > 0 && !itemAreas.some(a => userAreas.includes(a))) {
-                esDelUsuario = false;
-              }
-            }
 
+            const todosDocsObj = AppState.documentosPorObjeto.get(item._codigo) || [];
+            const docsUsuario = esLider ? todosDocsObj : todosDocsObj.filter(d => String(d.email || '').toLowerCase().trim() === emailActual);
+            const docsCount = docsUsuario.length;
+            
             const esSinDueno = ['E2E-06', 'E2E-07', 'E2E-09', 'E2E-10'].includes(item._codigo);
 
             return `
@@ -1925,12 +2043,7 @@ function renderizarPantallaPruebas() {
                 <td>
                   <strong>${item._nombre}</strong>
                   ${item.tx ? `<span style="color: #64748b; font-size: 11px; margin-left: 6px;">[Tx: ${item.tx}]</span>` : ''}
-                  ${!esDelUsuario && AppState.subvistaPruebas === 'todas' ? `
-                    <span class="badge-alcance-apoyo" title="Asignada a otra area. Si reporta, queda como APOYO.">
-                      ${item.areas ? item.areas.join(', ') : item.modulo}
-                    </span>
-                  ` : ''}
-                  ${esSinDueno ? `<span class="badge-sin-dueno">Sin ejecutor nominal</span>` : ''}
+                  ${esSinDueno && esLider ? `<span class="badge-sin-dueno">Sin ejecutor nominal</span>` : ''}
                 </td>
                 <td>
                   <span class="badge-estado estado-${estado}">${estado}</span>
@@ -1952,8 +2065,13 @@ function renderizarPantallaPruebas() {
                     <div style="font-size: 10px; color: #64748b;">${vig.email.split('@')[0]} (${vig.alcance})</div>
                   ` : '<span class="texto-vacio">Sin reportar</span>'}
                 </td>
-                <td>
+                <td style="text-align: center;">
                   ${docsCount > 0 ? `<span class="badge-doc-count">${docsCount}</span>` : '-'}
+                </td>
+                <td style="text-align: center;" onclick="event.stopPropagation();">
+                  <button type="button" class="btn-secundario btn-fila-reportar" data-codigo="${item._codigo}" style="padding: 3px 8px; font-size: 11px; white-space: nowrap;" title="Reportar nueva ejecución sobre este caso">
+                    + Reportar
+                  </button>
                 </td>
               </tr>
             `;
@@ -1979,6 +2097,14 @@ function enlazarEventosVistaPruebas() {
       renderizarApp();
     });
   }
+
+  document.querySelectorAll('.btn-fila-reportar').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const cod = e.currentTarget.dataset.codigo;
+      abrirModalReporteParaCodigo(cod);
+    });
+  });
 
   ['filtro-tipo', 'filtro-estado', 'filtro-modulo', 'filtro-area', 'filtro-golive'].forEach(id => {
     const el = document.getElementById(id);
@@ -2025,6 +2151,9 @@ function obtenerDetallePrueba(codigo) {
 function renderizarPantallaFicha() {
   const codigo = AppState.pruebaSeleccionada;
   const prueba = obtenerDetallePrueba(codigo);
+  const perfil = AppState.sesion ? AppState.sesion.perfil : {};
+  const esLider = esLiderOAdmin();
+  const emailActual = String(AppState.sesion?.usuario || perfil.email || '').toLowerCase().trim();
 
   if (!prueba) {
     return `
@@ -2035,13 +2164,34 @@ function renderizarPantallaFicha() {
     `;
   }
 
+  // Protección de acceso: cada usuario debe poder ver únicamente sus propias pruebas
+  if (!esPruebaAsignadaAUsuario(prueba, perfil)) {
+    return `
+      <div class="contenedor-ficha">
+        <div style="background: #fff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 32px 24px; text-align: center; max-width: 520px; margin: 40px auto; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05);">
+          <div style="font-size: 36px; margin-bottom: 12px;">🔒</div>
+          <h2 style="font-size: 18px; font-weight: 700; color: #1e293b; margin-bottom: 8px;">Prueba fuera de su ámbito asignado</h2>
+          <p style="color: #64748b; font-size: 13px; margin: 0 auto 20px auto; line-height: 1.5;">
+            La prueba <strong>${prueba._codigo}</strong> no está asignada a su perfil (${perfil.areas || perfil.modulos || perfil.departamento || 'Sin asignación'}). Cada usuario solo puede ver y gestionar sus pruebas propias.
+          </p>
+          <button class="btn-primario" onclick="window.location.hash='#pruebas'" style="width: auto; padding: 8px 20px;">
+            ← Volver a mis pruebas asignadas
+          </button>
+        </div>
+      </div>
+    `;
+  }
+
   const vig = AppState.resultadosVigentes.get(codigo);
-  const estadoActual = vig ? vig.resultado : 'PENDIENTE';
-  const historial = AppState.historialPorObjeto.get(codigo) || [];
+  const todosHistorial = AppState.historialPorObjeto.get(codigo) || [];
+
+  // Cada usuario ve únicamente su propio Historial de reportes de ejecución (Líder ve todos)
+  const historial = esLider ? todosHistorial : todosHistorial.filter(h => String(h.email || '').toLowerCase().trim() === emailActual);
+
+  const rPropio = obtenerResultadoVigenteUsuario(codigo, perfil);
+  const estadoActual = rPropio ? rPropio.resultado : (esLider && AppState.subvistaPruebas === 'todas' && vig ? vig.resultado : 'PENDIENTE');
+
   const docs = AppState.documentosPorObjeto.get(codigo) || [];
-  const esLider = esLiderOAdmin();
-  const incsPrueba = (AppState.incidencias || []).filter(i => String(i.objeto).toUpperCase() === String(codigo).toUpperCase());
-  const incAbierta = incsPrueba.find(i => i.estado !== 'CERRADA' && i.estado !== 'DESCARTADA');
 
   return `
     <div class="contenedor-ficha">
@@ -2052,39 +2202,22 @@ function renderizarPantallaFicha() {
             <span class="badge-codigo ${prueba._tipo === 'CU' ? 'badge-cu' : 'badge-e2e'}">${prueba._codigo}</span>
             <span class="badge-estado estado-${estadoActual}">${estadoActual}</span>
             ${prueba.golive ? `<span class="badge-codigo" style="background: #f1f5f9;">${prueba.golive}</span>` : ''}
+            <span style="font-size: 11px; color: #16a34a; font-weight: 600; margin-left: 6px; display: inline-flex; align-items: center; gap: 4px;">
+              ● Activa para reportes (${historial.length} reporte${historial.length !== 1 ? 's' : ''}${!esLider ? ' propio' + (historial.length !== 1 ? 's' : '') : ''})
+            </span>
           </div>
           <h1 class="ficha-nombre">${prueba._nombre}</h1>
         </div>
 
         <div class="ficha-acciones">
           <button class="btn-primario" style="padding: 8px 16px; font-size: 13px;" id="btn-abrir-reportar">
-            Reportar resultado
+            + Reportar resultado
           </button>
           <button class="btn-secundario" style="padding: 8px 12px; font-size: 13px;" id="btn-abrir-agregar-doc">
             + Agregar doc SAP
           </button>
         </div>
       </div>
-
-      ${incAbierta ? `
-        <div style="background-color: #fef2f2; border: 1px solid #fecaca; border-radius: 4px; padding: 12px 16px; margin-bottom: 16px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
-          <div>
-            <div style="font-weight: 700; color: #991b1b; font-size: 13px;">
-              ⚠️ Incidencia Activa: <code>${incAbierta.id}</code> [${incAbierta.severidad}] — ${incAbierta.titulo}
-            </div>
-            <div style="font-size: 12px; color: #7f1d1d; margin-top: 3px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
-              <span>Estado: <strong>${incAbierta.estado}</strong> · Responsable: ${incAbierta.asignada_a || 'Sin asignar'}</span>
-              ${incAbierta.transaccion ? `<span class="badge-modulo" style="background: #0f766e; font-size: 10px; padding: 1px 5px;">Tx: ${incAbierta.transaccion}</span>` : ''}
-              ${incAbierta.sociedad ? `<span class="badge-codigo" style="background: #e0f2fe; color: #0369a1; font-size: 10px; padding: 1px 5px; border: 1px solid #bae6fd; font-weight: 700;">Soc: ${incAbierta.sociedad}</span>` : ''}
-            </div>
-          </div>
-          ${esLider ? `
-            <button type="button" class="btn-primario btn-abrir-gestion-inc" data-id="${incAbierta.id}" style="padding: 6px 14px; font-size: 12px; background-color: #15803d; border-color: #15803d;">
-              Cerrar / Gestionar Incidencia
-            </button>
-          ` : ''}
-        </div>
-      ` : ''}
 
       <!-- Detalle estructurado segun catalogo -->
       <div class="seccion-ficha">
@@ -2206,9 +2339,12 @@ function renderizarPantallaFicha() {
 
       <!-- Historial de Reportes (Append-Only) -->
       <div class="seccion-ficha">
-        <div class="seccion-titulo">Historial de reportes de ejecucion (${historial.length})</div>
+        <div class="seccion-titulo">
+          Historial de reportes de ejecucion (${historial.length})
+          ${!esLider ? '<span style="font-size: 11px; font-weight: normal; color: #64748b; margin-left: 8px;">(Mostrando únicamente sus reportes propios)</span>' : ''}
+        </div>
         ${historial.length === 0 ? `
-          <p class="texto-vacio">Esta prueba aun no cuenta con reportes en el ciclo activo.</p>
+          <p class="texto-vacio">Usted aún no cuenta con reportes registrados para esta prueba en el ciclo activo.</p>
         ` : `
           <table class="tabla-historial">
             <thead>
@@ -2220,28 +2356,43 @@ function renderizarPantallaFicha() {
                 <th>Paso falla</th>
                 <th>Comentarios / Incidencia</th>
                 <th>Documentos</th>
+                <th style="width: 80px; text-align: center;">Acción</th>
               </tr>
             </thead>
             <tbody>
-              ${historial.slice().reverse().map(h => `
-                <tr>
-                  <td style="white-space: nowrap;">${h.ts}</td>
-                  <td><span class="badge-estado estado-${h.resultado}">${h.resultado}</span></td>
-                  <td>${h.email}</td>
-                  <td><strong>${h.alcance}</strong></td>
-                  <td>${h.paso ? `Paso ${h.paso}` : '-'}</td>
-                  <td>
-                    <div>${h.comentario || '<span class="texto-vacio">Sin comentario</span>'}</div>
-                    ${h.incidencia ? `
-                      <div style="margin-top: 4px; display: flex; align-items: center; gap: 8px;">
-                        <a href="#incidencias" style="color: #b71c1c; font-weight: 700;">Incidencia: ${h.incidencia}</a>
-                        ${esLider ? `<button type="button" class="btn-secundario btn-abrir-gestion-inc" data-id="${h.incidencia}" style="padding: 2px 6px; font-size: 10px;">Gestionar</button>` : ''}
-                      </div>
-                    ` : ''}
-                  </td>
-                  <td><span style="font-size: 11px;">${h.documentos || '-'}</span></td>
-                </tr>
-              `).join('')}
+              ${historial.slice().reverse().map(h => {
+                const esAutor = String(h.email || '').toLowerCase().trim() === emailActual;
+                return `
+                  <tr>
+                    <td style="white-space: nowrap;">${h.ts}</td>
+                    <td><span class="badge-estado estado-${h.resultado}">${h.resultado}</span></td>
+                    <td>${h.email}</td>
+                    <td><strong>${h.alcance}</strong></td>
+                    <td>${h.paso ? `Paso ${h.paso}` : '-'}</td>
+                    <td>
+                      <div>${h.comentario || '<span class="texto-vacio">Sin comentario</span>'}</div>
+                      ${h.incidencia ? `
+                        <div style="margin-top: 4px; display: flex; align-items: center; gap: 8px;">
+                          <a href="#incidencias" style="color: #b71c1c; font-weight: 700;">Incidencia: ${h.incidencia}</a>
+                          ${esLider ? `<button type="button" class="btn-secundario btn-abrir-gestion-inc" data-id="${h.incidencia}" style="padding: 2px 6px; font-size: 10px;">Gestionar</button>` : ''}
+                        </div>
+                      ` : ''}
+                    </td>
+                    <td><span style="font-size: 11px;">${h.documentos || '-'}</span></td>
+                    <td style="text-align: center;">
+                      ${esAutor ? `
+                        <button type="button" class="btn-editar-reporte-historial" data-id="${h.id}" title="Editar contenido o incorporar información adicional">
+                          ✏️ Editar
+                        </button>
+                      ` : `
+                        <span style="font-size: 11px; color: #94a3b8; font-style: italic;" title="Solo el autor (${h.email}) puede editar este reporte">
+                          🔒 Solo autor
+                        </span>
+                      `}
+                    </td>
+                  </tr>
+                `;
+              }).join('')}
             </tbody>
           </table>
         `}
@@ -2250,37 +2401,42 @@ function renderizarPantallaFicha() {
   `;
 }
 
+function abrirModalReporteParaCodigo(codigo) {
+  AppState.pruebaSeleccionada = codigo;
+  const prueba = obtenerDetallePrueba(codigo);
+  const perfil = AppState.sesion ? AppState.sesion.perfil : {};
+  
+  let txDef = '';
+  if (prueba) {
+    if (prueba._tipo === 'CU' && prueba.tx) txDef = prueba.tx;
+    else if (prueba._tipo === 'E2E' && Array.isArray(prueba.pasos) && prueba.pasos.length > 0) txDef = prueba.pasos[0].tx || '';
+  }
+
+  let modDef = 'MM';
+  if (prueba && prueba.modulo) modDef = prueba.modulo;
+
+  FormReporte.resultado = 'OK';
+  FormReporte.pasoFalla = '';
+  FormReporte.comentario = '';
+  FormReporte.incidencia = {
+    titulo: '',
+    detalle: '',
+    severidad: 'CRITICA',
+    modulo: modDef,
+    transaccion: txDef,
+    sociedad: (perfil && perfil.sociedad) ? perfil.sociedad : 'CL11'
+  };
+  FormReporte.documentos = [];
+
+  AppState.modalReporteAbierto = true;
+  renderizarApp();
+}
+
 function enlazarEventosVistaFicha() {
   const btnRep = document.getElementById('btn-abrir-reportar');
   if (btnRep) {
     btnRep.addEventListener('click', () => {
-      const prueba = obtenerDetallePrueba(AppState.pruebaSeleccionada);
-      const perfil = AppState.sesion ? AppState.sesion.perfil : {};
-      
-      let txDef = '';
-      if (prueba) {
-        if (prueba._tipo === 'CU' && prueba.tx) txDef = prueba.tx;
-        else if (prueba._tipo === 'E2E' && Array.isArray(prueba.pasos) && prueba.pasos.length > 0) txDef = prueba.pasos[0].tx || '';
-      }
-
-      let modDef = 'MM';
-      if (prueba && prueba.modulo) modDef = prueba.modulo;
-
-      FormReporte.resultado = 'OK';
-      FormReporte.pasoFalla = '';
-      FormReporte.comentario = '';
-      FormReporte.incidencia = {
-        titulo: '',
-        detalle: '',
-        severidad: 'CRITICA',
-        modulo: modDef,
-        transaccion: txDef,
-        sociedad: (perfil && perfil.sociedad) ? perfil.sociedad : 'CL11'
-      };
-      FormReporte.documentos = [];
-
-      AppState.modalReporteAbierto = true;
-      renderizarApp();
+      abrirModalReporteParaCodigo(AppState.pruebaSeleccionada);
     });
   }
 
@@ -2299,6 +2455,28 @@ function enlazarEventosVistaFicha() {
       if (!inc) return;
       AppState.incidenciaEnGestion = inc;
       AppState.modalIncidenciaAbierto = true;
+      renderizarApp();
+    });
+  });
+
+  document.querySelectorAll('.btn-editar-reporte-historial').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      const id = e.currentTarget.dataset.id;
+      const historial = AppState.historialPorObjeto.get(AppState.pruebaSeleccionada) || [];
+      const rep = historial.find(h => String(h.id) === String(id));
+      if (!rep) return;
+
+      const emailActual = String(AppState.sesion?.usuario || AppState.sesion?.perfil?.email || '').toLowerCase().trim();
+      const emailAutor = String(rep.email || '').toLowerCase().trim();
+      if (emailActual !== emailAutor) {
+        alert('Acceso restringido: Ningún usuario puede editar el resultado reportado por otro usuario.');
+        return;
+      }
+
+      AppState.reporteEnEdicion = { ...rep };
+      AppState.edicionNuevosDocs = [];
+      AppState.guardandoEdicionReporte = false;
+      AppState.modalEditarReporteAbierto = true;
       renderizarApp();
     });
   });
@@ -2567,35 +2745,89 @@ function renderizarModalReportar() {
   `;
 }
 
+let guardandoReporte = false;
+
+function sincronizarCamposFormReporte() {
+  const com = document.getElementById('rep-comentario');
+  if (com) FormReporte.comentario = com.value;
+
+  const pasoFalla = document.getElementById('rep-paso-falla');
+  if (pasoFalla) FormReporte.pasoFalla = pasoFalla.value;
+
+  const incTit = document.getElementById('inc-titulo');
+  if (incTit) FormReporte.incidencia.titulo = incTit.value;
+  const incDet = document.getElementById('inc-detalle');
+  if (incDet) FormReporte.incidencia.detalle = incDet.value;
+  const incTx = document.getElementById('inc-transaccion');
+  if (incTx) FormReporte.incidencia.transaccion = incTx.value;
+  const incSoc = document.getElementById('inc-sociedad');
+  if (incSoc) FormReporte.incidencia.sociedad = incSoc.value;
+  const incSev = document.getElementById('inc-severidad');
+  if (incSev) FormReporte.incidencia.severidad = incSev.value;
+  const incMod = document.getElementById('inc-modulo');
+  if (incMod) FormReporte.incidencia.modulo = incMod.value;
+
+  // Sincronizar todos los inputs de documentos
+  document.querySelectorAll('.fila-doc-input').forEach(fila => {
+    const idx = parseInt(fila.dataset.idx, 10);
+    if (!isNaN(idx) && FormReporte.documentos[idx]) {
+      const selTipo = fila.querySelector('.sel-doc-tipo');
+      const inpNum = fila.querySelector('.inp-doc-numero');
+      const inpSoc = fila.querySelector('.inp-doc-sociedad');
+      const inpEj = fila.querySelector('.inp-doc-ejercicio');
+      const selPaso = fila.querySelector('.sel-doc-paso');
+      if (selTipo) FormReporte.documentos[idx].tipo = selTipo.value;
+      if (inpNum) FormReporte.documentos[idx].numero = inpNum.value;
+      if (inpSoc) FormReporte.documentos[idx].sociedad = inpSoc.value;
+      if (inpEj) FormReporte.documentos[idx].ejercicio = inpEj.value;
+      if (selPaso) FormReporte.documentos[idx].paso = selPaso.value;
+    }
+  });
+}
+
 function enlazarEventosModalReportar() {
   const btnCerrar = document.getElementById('btn-cerrar-modal-rep');
   const btnCancelar = document.getElementById('btn-cancelar-rep');
   const cerrar = () => {
+    if (guardandoReporte) return;
     AppState.modalReporteAbierto = false;
     renderizarApp();
   };
   if (btnCerrar) btnCerrar.addEventListener('click', cerrar);
   if (btnCancelar) btnCancelar.addEventListener('click', cerrar);
 
+  // Escucha activa en comentarios y campos para evitar pérdida de datos
+  const inpComentario = document.getElementById('rep-comentario');
+  if (inpComentario) {
+    inpComentario.addEventListener('input', (e) => {
+      FormReporte.comentario = e.target.value;
+    });
+  }
+
+  const inpIncTit = document.getElementById('inc-titulo');
+  if (inpIncTit) {
+    inpIncTit.addEventListener('input', (e) => {
+      FormReporte.incidencia.titulo = e.target.value;
+    });
+  }
+
+  const inpIncDet = document.getElementById('inc-detalle');
+  if (inpIncDet) {
+    inpIncDet.addEventListener('input', (e) => {
+      FormReporte.incidencia.detalle = e.target.value;
+    });
+  }
+
+  const inpIncTx = document.getElementById('inc-transaccion');
+  if (inpIncTx) {
+    inpIncTx.addEventListener('input', (e) => {
+      FormReporte.incidencia.transaccion = e.target.value;
+    });
+  }
+
   document.querySelectorAll('.btn-resultado').forEach(btn => {
     btn.addEventListener('click', () => {
-      // Guardar campos actuales antes de re-renderizar para no perder el texto ingresado
-      const comActual = document.getElementById('rep-comentario')?.value;
-      if (comActual !== undefined) FormReporte.comentario = comActual;
-
-      const incTit = document.getElementById('inc-titulo')?.value;
-      if (incTit !== undefined) FormReporte.incidencia.titulo = incTit;
-      const incDet = document.getElementById('inc-detalle')?.value;
-      if (incDet !== undefined) FormReporte.incidencia.detalle = incDet;
-      const incTx = document.getElementById('inc-transaccion')?.value;
-      if (incTx !== undefined) FormReporte.incidencia.transaccion = incTx;
-      const incSoc = document.getElementById('inc-sociedad')?.value;
-      if (incSoc !== undefined) FormReporte.incidencia.sociedad = incSoc;
-      const incSev = document.getElementById('inc-severidad')?.value;
-      if (incSev !== undefined) FormReporte.incidencia.severidad = incSev;
-      const incMod = document.getElementById('inc-modulo')?.value;
-      if (incMod !== undefined) FormReporte.incidencia.modulo = incMod;
-
+      sincronizarCamposFormReporte();
       FormReporte.resultado = btn.dataset.res;
       renderizarApp();
     });
@@ -2604,6 +2836,7 @@ function enlazarEventosModalReportar() {
   const selPasoFalla = document.getElementById('rep-paso-falla');
   if (selPasoFalla) {
     selPasoFalla.addEventListener('change', (e) => {
+      sincronizarCamposFormReporte();
       FormReporte.pasoFalla = e.target.value;
       const prueba = obtenerDetallePrueba(AppState.pruebaSeleccionada);
       if (prueba && prueba._tipo === 'E2E' && Array.isArray(prueba.pasos)) {
@@ -2623,13 +2856,14 @@ function enlazarEventosModalReportar() {
   const btnAgregarDoc = document.getElementById('btn-form-agregar-doc');
   if (btnAgregarDoc) {
     btnAgregarDoc.addEventListener('click', () => {
+      sincronizarCamposFormReporte();
       const prueba = obtenerDetallePrueba(AppState.pruebaSeleccionada);
       const tipos = proponerTiposDocParaPrueba(prueba);
-      const perfil = AppState.sesion.perfil;
+      const perfil = AppState.sesion ? AppState.sesion.perfil : {};
       FormReporte.documentos.push({
         tipo: tipos[0] ? tipos[0].codigo : 'PEDIDO_VENTA',
         numero: '',
-        sociedad: perfil.sociedad || 'CL11',
+        sociedad: (perfil && perfil.sociedad) ? perfil.sociedad : 'CL11',
         ejercicio: 2026,
         paso: ''
       });
@@ -2639,56 +2873,70 @@ function enlazarEventosModalReportar() {
 
   document.querySelectorAll('.sel-doc-tipo').forEach(sel => {
     sel.addEventListener('change', (e) => {
-      const idx = e.target.dataset.idx;
-      FormReporte.documentos[idx].tipo = e.target.value;
-      renderizarApp();
+      sincronizarCamposFormReporte();
+      const idx = parseInt(e.currentTarget.dataset.idx, 10);
+      if (!isNaN(idx) && FormReporte.documentos[idx]) {
+        FormReporte.documentos[idx].tipo = e.currentTarget.value;
+        renderizarApp();
+      }
     });
   });
 
   document.querySelectorAll('.inp-doc-numero').forEach(inp => {
     inp.addEventListener('input', (e) => {
-      const idx = e.target.dataset.idx;
-      FormReporte.documentos[idx].numero = e.target.value;
-    });
-    inp.addEventListener('blur', () => {
-      renderizarApp();
+      const idx = parseInt(e.target.dataset.idx, 10);
+      if (!isNaN(idx) && FormReporte.documentos[idx]) {
+        FormReporte.documentos[idx].numero = e.target.value;
+      }
     });
   });
 
   document.querySelectorAll('.inp-doc-sociedad').forEach(inp => {
-    inp.addEventListener('input', (e) => {
-      const idx = e.target.dataset.idx;
-      FormReporte.documentos[idx].sociedad = e.target.value;
+    inp.addEventListener('change', (e) => {
+      const idx = parseInt(e.target.dataset.idx, 10);
+      if (!isNaN(idx) && FormReporte.documentos[idx]) {
+        FormReporte.documentos[idx].sociedad = e.target.value;
+      }
     });
   });
 
   document.querySelectorAll('.inp-doc-ejercicio').forEach(inp => {
     inp.addEventListener('input', (e) => {
-      const idx = e.target.dataset.idx;
-      FormReporte.documentos[idx].ejercicio = e.target.value;
+      const idx = parseInt(e.target.dataset.idx, 10);
+      if (!isNaN(idx) && FormReporte.documentos[idx]) {
+        FormReporte.documentos[idx].ejercicio = e.target.value;
+      }
     });
   });
 
   document.querySelectorAll('.sel-doc-paso').forEach(sel => {
     sel.addEventListener('change', (e) => {
-      const idx = e.target.dataset.idx;
-      FormReporte.documentos[idx].paso = e.target.value;
+      const idx = parseInt(e.target.dataset.idx, 10);
+      if (!isNaN(idx) && FormReporte.documentos[idx]) {
+        FormReporte.documentos[idx].paso = e.target.value;
+      }
     });
   });
 
   document.querySelectorAll('.btn-eliminar-doc').forEach(btn => {
     btn.addEventListener('click', (e) => {
-      const idx = e.target.dataset.idx;
-      FormReporte.documentos.splice(idx, 1);
-      renderizarApp();
+      sincronizarCamposFormReporte();
+      const idx = parseInt(e.currentTarget.dataset.idx, 10);
+      if (!isNaN(idx)) {
+        FormReporte.documentos.splice(idx, 1);
+        renderizarApp();
+      }
     });
   });
 
   const ejecutarGuardarReporte = async (e) => {
     if (e && e.preventDefault) e.preventDefault();
+    if (guardandoReporte) return;
 
-    const comentario = (document.getElementById('rep-comentario')?.value || '').trim();
-    const pasoFalla = document.getElementById('rep-paso-falla')?.value || null;
+    sincronizarCamposFormReporte();
+
+    const comentario = (FormReporte.comentario || '').trim();
+    const pasoFalla = FormReporte.pasoFalla || null;
     const prueba = obtenerDetallePrueba(AppState.pruebaSeleccionada);
 
     if (FormReporte.resultado === 'NOK') {
@@ -2696,10 +2944,10 @@ function enlazarEventosModalReportar() {
         alert('En escenarios E2E con resultado NOK debe seleccionar obligatoriamente el paso donde falló.');
         return;
       }
-      const incTitulo = (document.getElementById('inc-titulo')?.value || '').trim();
-      const incDetalle = (document.getElementById('inc-detalle')?.value || '').trim();
-      const incTx = (document.getElementById('inc-transaccion')?.value || '').trim().toUpperCase();
-      const incSoc = (document.getElementById('inc-sociedad')?.value || '').trim().toUpperCase();
+      const incTitulo = (FormReporte.incidencia.titulo || '').trim();
+      const incDetalle = (FormReporte.incidencia.detalle || '').trim();
+      const incTx = (FormReporte.incidencia.transaccion || '').trim().toUpperCase();
+      const incSoc = (FormReporte.incidencia.sociedad || '').trim().toUpperCase();
 
       if (!incTitulo || !incDetalle) {
         alert('Para guardar un resultado NOK debe completar obligatoriamente el título y detalle de la incidencia.');
@@ -2728,11 +2976,17 @@ function enlazarEventosModalReportar() {
       return;
     }
 
+    // Bloqueo de concurrencia y protección contra envíos dobles
+    guardandoReporte = true;
     const btnSubmit = document.getElementById('btn-guardar-rep');
+    const btnCancelar = document.getElementById('btn-cancelar-rep');
+    const btnCerrar = document.getElementById('btn-cerrar-modal-rep');
     if (btnSubmit) {
       btnSubmit.disabled = true;
       btnSubmit.innerHTML = '<span class="spinner"></span> Guardando...';
     }
+    if (btnCancelar) btnCancelar.disabled = true;
+    if (btnCerrar) btnCerrar.disabled = true;
 
     try {
       const idCliente = 'R-' + Date.now() + '-' + Math.random().toString(36).substring(2, 6);
@@ -2752,14 +3006,24 @@ function enlazarEventosModalReportar() {
       };
 
       const resp = await api('reportar', payload);
-      mostrarToast('Resultado guardado correctamente.');
 
+      // CERRAR VENTANA MODAL Y RESETEAR FORMULARIO DE INMEDIATO
+      AppState.modalReporteAbierto = false;
       FormReporte.documentos = [];
       FormReporte.comentario = '';
       FormReporte.resultado = 'OK';
-      AppState.modalReporteAbierto = false;
+      FormReporte.pasoFalla = '';
+      FormReporte.incidencia = {
+        titulo: '',
+        detalle: '',
+        severidad: 'CRITICA',
+        modulo: 'MM',
+        transaccion: '',
+        sociedad: 'CL11'
+      };
 
-      // Actualización inmediata en cliente para respuesta instantánea al usuario
+      mostrarToast('Resultado guardado correctamente.');
+
       // Determinar si para el usuario reportante este resultado es asignada o apoyo
       let esApoyoReporte = false;
       if (prueba._tipo === 'E2E') {
@@ -2770,10 +3034,11 @@ function enlazarEventosModalReportar() {
         esApoyoReporte = modulosUser.length > 0 && !modulosUser.includes(String(prueba.modulo).toUpperCase()) && AppState.sesion.perfil.rol !== 'LIDER';
       }
       const alcanceFinal = (resp && resp.resultado && resp.resultado.alcance) ? resp.resultado.alcance : (esApoyoReporte ? 'APOYO' : 'ASIGNADA');
+      const tsActual = (resp && resp.resultado && resp.resultado.ts) ? resp.resultado.ts : new Date().toISOString().replace('T', ' ').substring(0, 19);
 
       const nuevoResultado = (resp && resp.resultado) ? resp.resultado : {
         id: payload.id,
-        ts: tsLocal,
+        ts: tsActual,
         tipo: payload.tipo,
         objeto: payload.objeto,
         resultado: payload.resultado,
@@ -2798,13 +3063,19 @@ function enlazarEventosModalReportar() {
         AppState.incidencias.unshift(resp.incidencia);
       }
       if (resp && resp.documentos && Array.isArray(resp.documentos)) {
-        resp.documentos.forEach(d => AppState.documentos.unshift(d));
+        resp.documentos.forEach(d => {
+          AppState.documentos.unshift(d);
+          if (!AppState.documentosPorObjeto.has(d.objeto)) {
+            AppState.documentosPorObjeto.set(d.objeto, []);
+          }
+          AppState.documentosPorObjeto.get(d.objeto).unshift(d);
+        });
       }
 
-      // Renderizado inmediato
+      // Renderizado inmediato ya con el modal cerrado
       renderizarApp();
 
-      // Sincronización en segundo plano sin congelar la pantalla
+      // Sincronización en segundo plano con el servidor
       sincronizarEstadoServidor().then(() => renderizarApp()).catch(() => {});
     } catch (err) {
       alert('Error al guardar reporte: ' + err.message);
@@ -2812,6 +3083,10 @@ function enlazarEventosModalReportar() {
         btnSubmit.disabled = false;
         btnSubmit.innerHTML = 'Guardar resultado';
       }
+      if (btnCancelar) btnCancelar.disabled = false;
+      if (btnCerrar) btnCerrar.disabled = false;
+    } finally {
+      guardandoReporte = false;
     }
   };
 
@@ -2970,6 +3245,366 @@ function enlazarEventosModalDoc() {
     });
   }
 }
+
+/* ==========================================================================
+   MODAL DE EDICION DE REPORTE EXISTENTE EN HISTORIAL
+   ========================================================================== */
+function sincronizarCamposFormEdicionReporte() {
+  if (!AppState.reporteEnEdicion) return;
+  const res = document.getElementById('editar-rep-resultado');
+  if (res) AppState.reporteEnEdicion.resultado = res.value;
+  const paso = document.getElementById('editar-rep-paso');
+  if (paso) AppState.reporteEnEdicion.paso = paso.value;
+  const com = document.getElementById('editar-rep-comentario');
+  if (com) AppState.reporteEnEdicion.comentario = com.value;
+}
+
+function renderizarModalEditarReporte() {
+  const h = AppState.reporteEnEdicion;
+  if (!h) return '';
+  const codigoPrueba = AppState.pruebaSeleccionada || h.objeto;
+  const prueba = obtenerDetallePrueba(codigoPrueba);
+  const perfil = AppState.sesion ? AppState.sesion.perfil : {};
+  const tipos = proponerTiposDocParaPrueba(prueba);
+
+  return `
+    <div class="modal-fondo">
+      <div class="modal-cuerpo" style="max-width: 620px;">
+        <div class="modal-cabecera">
+          <div>
+            <div class="modal-titulo">✏️ Editar Reporte de Ejecución</div>
+            <div style="font-size: 12px; color: var(--texto-atenuado); margin-top: 2px;">
+              ${prueba ? `${prueba._codigo}: ${prueba._nombre}` : h.objeto}
+            </div>
+          </div>
+          <button class="btn-cerrar-modal" id="btn-cerrar-modal-editar-rep" ${AppState.guardandoEdicionReporte ? 'disabled' : ''}>&times;</button>
+        </div>
+
+        <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 10px 14px; margin-bottom: 16px; font-size: 12px; display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 8px;">
+          <div><span style="color: #64748b;">Reportado por:</span><br><strong>${h.email}</strong></div>
+          <div><span style="color: #64748b;">Fecha/Hora:</span><br><strong>${h.ts}</strong></div>
+          <div><span style="color: #64748b;">Alcance:</span><br><span class="badge-alcance ${h.alcance === 'ASIGNADA' ? 'badge-asignada' : 'badge-apoyo'}">${h.alcance}</span></div>
+          ${h.incidencia ? `<div><span style="color: #64748b;">Incidencia:</span><br><a href="#incidencias" style="color: #b71c1c; font-weight: 700;">${h.incidencia}</a></div>` : ''}
+        </div>
+
+        <form id="form-editar-reporte" onsubmit="event.preventDefault();">
+          <div style="display: flex; gap: 12px; margin-bottom: 12px;">
+            <div class="form-grupo" style="flex: 1;">
+              <label for="editar-rep-resultado">Resultado de la prueba *</label>
+              <select id="editar-rep-resultado" class="form-select">
+                <option value="OK" ${h.resultado === 'OK' ? 'selected' : ''}>OK — Exitosa</option>
+                <option value="NOK" ${h.resultado === 'NOK' ? 'selected' : ''}>NOK — Con falla</option>
+                <option value="BLOQUEADO" ${h.resultado === 'BLOQUEADO' ? 'selected' : ''}>BLOQUEADO — Prerequisito no disponible</option>
+                <option value="NO_APLICA" ${h.resultado === 'NO_APLICA' ? 'selected' : ''}>NO_APLICA — Fuera de alcance</option>
+              </select>
+            </div>
+
+            ${prueba && prueba._tipo === 'E2E' ? `
+              <div class="form-grupo" style="flex: 1;" id="grupo-editar-rep-paso">
+                <label for="editar-rep-paso">Paso del escenario</label>
+                <select id="editar-rep-paso" class="form-select">
+                  <option value="">General / Todo el escenario</option>
+                  ${(prueba.pasos || []).map(p => `
+                    <option value="${p.n}" ${String(h.paso) === String(p.n) ? 'selected' : ''}>
+                      Paso ${p.n}: ${p.etapa} (${p.area || ''})
+                    </option>
+                  `).join('')}
+                </select>
+              </div>
+            ` : ''}
+          </div>
+
+          <div class="form-grupo">
+            <label for="editar-rep-comentario">
+              Comentarios / Observaciones / Información Adicional
+            </label>
+            <textarea id="editar-rep-comentario" class="form-input" rows="4" placeholder="Incorpore notas adicionales, contexto de la ejecución, detalles de validación o correcciones...">${h.comentario || ''}</textarea>
+          </div>
+
+          <!-- Documentos SAP registrados e incorporación de nuevos documentos -->
+          <div class="form-grupo" style="margin-top: 14px;">
+            <label>Documentos SAP asociados al reporte</label>
+            <div style="font-size: 11px; color: #475569; margin-bottom: 6px; padding: 6px 10px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 4px;">
+              ${h.documentos && h.documentos.trim() && h.documentos !== '-' 
+                ? `<span>Documentos iniciales: <strong>${h.documentos}</strong></span>` 
+                : '<span style="color: #64748b;">Sin documentos SAP registrados originalmente.</span>'}
+            </div>
+
+            <!-- Lista de nuevos documentos agregados en esta edición -->
+            ${AppState.edicionNuevosDocs && AppState.edicionNuevosDocs.length > 0 ? `
+              <div style="margin-bottom: 8px; border: 1px solid #cbd5e1; border-radius: 6px; overflow: hidden;">
+                <table style="width: 100%; font-size: 11px; border-collapse: collapse;">
+                  <thead style="background: #f1f5f9;">
+                    <tr>
+                      <th style="padding: 5px 8px; text-align: left;">Tipo</th>
+                      <th style="padding: 5px 8px; text-align: left;">Número SAP</th>
+                      <th style="padding: 5px 8px; text-align: left;">Sociedad</th>
+                      <th style="padding: 5px 8px; width: 40px; text-align: center;"></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    ${AppState.edicionNuevosDocs.map((doc, idx) => `
+                      <tr style="border-top: 1px solid #e2e8f0;">
+                        <td style="padding: 5px 8px;"><strong>${doc.tipo}</strong></td>
+                        <td style="padding: 5px 8px;"><code style="font-weight: 700;">${doc.numero}</code></td>
+                        <td style="padding: 5px 8px;">${doc.sociedad}</td>
+                        <td style="padding: 5px 8px; text-align: center;">
+                          <button type="button" class="btn-eliminar-nuevo-doc" data-idx="${idx}" title="Quitar este documento" style="background: none; border: none; color: #dc2626; cursor: pointer; font-size: 14px; font-weight: bold;">&times;</button>
+                        </td>
+                      </tr>
+                    `).join('')}
+                  </tbody>
+                </table>
+              </div>
+            ` : ''}
+
+            <!-- Subformulario para incorporar documento SAP adicional -->
+            <div style="background: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 6px; padding: 10px; margin-top: 6px;">
+              <div style="font-size: 11px; font-weight: 600; color: #334155; margin-bottom: 6px;">+ Incorporar nuevo documento SAP:</div>
+              <div style="display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-end;">
+                <div style="flex: 2; min-width: 130px;">
+                  <label style="font-size: 10px; color: #64748b;">Tipo</label>
+                  <select id="editar-nuevo-doc-tipo" class="form-select" style="font-size: 11px; padding: 5px 8px;">
+                    ${tipos.map(t => `<option value="${t.codigo}">${t.nombre} (${t.codigo})</option>`).join('')}
+                  </select>
+                </div>
+                <div style="flex: 2; min-width: 140px;">
+                  <label style="font-size: 10px; color: #64748b;">Número SAP</label>
+                  <input type="text" id="editar-nuevo-doc-numero" class="form-input" placeholder="ej: 4500001234" style="font-size: 11px; padding: 5px 8px;">
+                </div>
+                <div style="flex: 1; min-width: 85px;">
+                  <label style="font-size: 10px; color: #64748b;">Sociedad</label>
+                  <select id="editar-nuevo-doc-sociedad" class="form-select" style="font-size: 11px; padding: 5px 8px;">
+                    ${LISTA_SOCIEDADES.map(s => `<option value="${s.codigo}" ${(perfil.sociedad || 'CL11') === s.codigo ? 'selected' : ''}>${s.codigo}</option>`).join('')}
+                  </select>
+                </div>
+                <div>
+                  <button type="button" class="btn-secundario" id="btn-agregar-doc-edicion" style="font-size: 11px; padding: 6px 12px; white-space: nowrap;">
+                    + Agregar
+                  </button>
+                </div>
+              </div>
+              <div id="aviso-patron-edicion" class="doc-aviso-patron" style="display: none; margin-top: 6px; font-size: 11px;"></div>
+            </div>
+          </div>
+
+          <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; border-top: 1px solid #e2e8f0; padding-top: 14px;">
+            <button type="button" class="btn-secundario" id="btn-cancelar-editar-rep" ${AppState.guardandoEdicionReporte ? 'disabled' : ''}>
+              Cancelar
+            </button>
+            <button type="submit" class="btn-primario" id="btn-guardar-editar-rep" style="width: auto; min-width: 150px;" ${AppState.guardandoEdicionReporte ? 'disabled' : ''}>
+              ${AppState.guardandoEdicionReporte ? '<span class="spinner"></span> Guardando cambios...' : '💾 Guardar Cambios'}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+function enlazarEventosModalEditarReporte() {
+  const cerrar = () => {
+    if (AppState.guardandoEdicionReporte) return;
+    AppState.modalEditarReporteAbierto = false;
+    AppState.reporteEnEdicion = null;
+    AppState.edicionNuevosDocs = [];
+    renderizarApp();
+  };
+
+  document.getElementById('btn-cerrar-modal-editar-rep')?.addEventListener('click', cerrar);
+  document.getElementById('btn-cancelar-editar-rep')?.addEventListener('click', cerrar);
+
+  const inpNuevoNum = document.getElementById('editar-nuevo-doc-numero');
+  const selNuevoTipo = document.getElementById('editar-nuevo-doc-tipo');
+  const divAvisoEd = document.getElementById('aviso-patron-edicion');
+
+  function verificarPatronEdicion() {
+    if (!inpNuevoNum || !selNuevoTipo || !divAvisoEd) return;
+    const def = LISTA_TIPOS_DOC.find(x => x.codigo === selNuevoTipo.value);
+    if (def && def.patron && inpNuevoNum.value.trim()) {
+      const reg = new RegExp(def.patron);
+      if (!reg.test(inpNuevoNum.value.trim())) {
+        divAvisoEd.style.display = 'block';
+        divAvisoEd.textContent = `⚠️ Formato sugerido para ${def.nombre}: ${def.patron}. Puede guardar de todas formas.`;
+        return;
+      }
+    }
+    divAvisoEd.style.display = 'none';
+  }
+
+  inpNuevoNum?.addEventListener('input', verificarPatronEdicion);
+  selNuevoTipo?.addEventListener('change', verificarPatronEdicion);
+
+  const txtComentario = document.getElementById('editar-rep-comentario');
+  if (txtComentario && AppState.reporteEnEdicion) {
+    txtComentario.addEventListener('input', (e) => {
+      AppState.reporteEnEdicion.comentario = e.target.value;
+    });
+  }
+
+  const selRes = document.getElementById('editar-rep-resultado');
+  if (selRes && AppState.reporteEnEdicion) {
+    selRes.addEventListener('change', (e) => {
+      AppState.reporteEnEdicion.resultado = e.target.value;
+    });
+  }
+
+  const selPaso = document.getElementById('editar-rep-paso');
+  if (selPaso && AppState.reporteEnEdicion) {
+    selPaso.addEventListener('change', (e) => {
+      AppState.reporteEnEdicion.paso = e.target.value;
+    });
+  }
+
+  const btnAddDoc = document.getElementById('btn-agregar-doc-edicion');
+  if (btnAddDoc) {
+    btnAddDoc.addEventListener('click', () => {
+      sincronizarCamposFormEdicionReporte();
+      const num = inpNuevoNum ? inpNuevoNum.value.trim() : '';
+      if (!num) {
+        if (divAvisoEd) {
+          divAvisoEd.style.display = 'block';
+          divAvisoEd.textContent = 'Ingrese el número del documento SAP.';
+        }
+        inpNuevoNum?.focus();
+        return;
+      }
+
+      const tipo = selNuevoTipo ? selNuevoTipo.value : 'DOC';
+      const soc = document.getElementById('editar-nuevo-doc-sociedad')?.value || 'CL11';
+      const paso = document.getElementById('editar-rep-paso')?.value || AppState.reporteEnEdicion?.paso || null;
+
+      if (!AppState.edicionNuevosDocs) AppState.edicionNuevosDocs = [];
+      AppState.edicionNuevosDocs.push({
+        tipo,
+        numero: num,
+        sociedad: soc,
+        ejercicio: 2026,
+        paso: paso ? Number(paso) : null
+      });
+
+      renderizarApp();
+    });
+  }
+
+  document.querySelectorAll('.btn-eliminar-nuevo-doc').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      sincronizarCamposFormEdicionReporte();
+      const idx = parseInt(e.currentTarget.dataset.idx, 10);
+      if (!isNaN(idx) && AppState.edicionNuevosDocs) {
+        AppState.edicionNuevosDocs.splice(idx, 1);
+        renderizarApp();
+      }
+    });
+  });
+
+  const form = document.getElementById('form-editar-reporte');
+  if (form) {
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      if (AppState.guardandoEdicionReporte) return;
+      sincronizarCamposFormEdicionReporte();
+
+      AppState.guardandoEdicionReporte = true;
+      renderizarApp();
+
+      const repOriginal = AppState.reporteEnEdicion;
+      const emailActual = String(AppState.sesion?.usuario || AppState.sesion?.perfil?.email || '').toLowerCase().trim();
+      const emailAutor = String(repOriginal.email || '').toLowerCase().trim();
+      if (emailActual !== emailAutor) {
+        alert('Acceso denegado: Ningún usuario puede editar el resultado reportado por otro usuario.');
+        AppState.guardandoEdicionReporte = false;
+        renderizarApp();
+        return;
+      }
+
+      const nuevoResultado = repOriginal.resultado || 'OK';
+      const nuevoPaso = repOriginal.paso || '';
+      const nuevoComentario = repOriginal.comentario || '';
+      
+      const nuevosDocsArr = AppState.edicionNuevosDocs || [];
+      const partesDocs = [];
+      if (repOriginal.documentos && repOriginal.documentos.trim() && repOriginal.documentos !== '-') {
+        partesDocs.push(repOriginal.documentos.trim());
+      }
+      nuevosDocsArr.forEach(d => {
+        const def = LISTA_TIPOS_DOC.find(x => x.codigo === d.tipo);
+        const label = def ? def.nombre : d.tipo;
+        partesDocs.push(`${label} ${d.numero}`);
+      });
+      const nuevoResumenDocs = partesDocs.join(' · ');
+
+      const payload = {
+        id: repOriginal.id,
+        objeto: repOriginal.objeto,
+        tipo: repOriginal.tipo,
+        resultado: nuevoResultado,
+        paso: nuevoPaso,
+        comentario: nuevoComentario,
+        nuevosDocumentos: nuevosDocsArr,
+        documentosTexto: nuevoResumenDocs
+      };
+
+      try {
+        await api('actualizarReporte', payload);
+      } catch (errApi) {
+        console.warn('api(actualizarReporte) advertencia:', errApi);
+      }
+
+      // 1. Actualizar en AppState.historialPorObjeto
+      const hist = AppState.historialPorObjeto.get(repOriginal.objeto) || [];
+      const itemEnHist = hist.find(h => String(h.id) === String(repOriginal.id));
+      if (itemEnHist) {
+        itemEnHist.resultado = nuevoResultado;
+        itemEnHist.paso = nuevoPaso;
+        itemEnHist.comentario = nuevoComentario;
+        itemEnHist.documentos = nuevoResumenDocs;
+      }
+
+      // 2. Actualizar en AppState.resultadosVigentes si este era el vigente
+      const vig = AppState.resultadosVigentes.get(repOriginal.objeto);
+      if (vig && String(vig.id) === String(repOriginal.id)) {
+        vig.resultado = nuevoResultado;
+        vig.paso = nuevoPaso;
+        vig.comentario = nuevoComentario;
+        vig.documentos = nuevoResumenDocs;
+      }
+
+      // 3. Incorporar documentos nuevos al estado local
+      if (nuevosDocsArr.length > 0) {
+        if (!AppState.documentosPorObjeto.has(repOriginal.objeto)) {
+          AppState.documentosPorObjeto.set(repOriginal.objeto, []);
+        }
+        const listaDocsObj = AppState.documentosPorObjeto.get(repOriginal.objeto);
+        nuevosDocsArr.forEach((d, idx) => {
+          listaDocsObj.push({
+            id: 'D-ED-' + Date.now() + '-' + idx,
+            resultado_id: repOriginal.id,
+            tipo: d.tipo,
+            numero: d.numero,
+            sociedad: d.sociedad,
+            ejercicio: d.ejercicio || 2026,
+            tipo_objeto: repOriginal.tipo,
+            objeto: repOriginal.objeto,
+            paso: d.paso,
+            email: AppState.sesion ? AppState.sesion.usuario : '',
+            ts: new Date().toISOString().replace('T', ' ').substring(0, 19)
+          });
+        });
+      }
+
+      AppState.guardandoEdicionReporte = false;
+      AppState.modalEditarReporteAbierto = false;
+      AppState.reporteEnEdicion = null;
+      AppState.edicionNuevosDocs = [];
+
+      mostrarToast('✓ Reporte de ejecución actualizado correctamente.');
+      renderizarApp();
+      sincronizarEstadoServidor().then(() => renderizarApp()).catch(() => {});
+    });
+  }
+}
+
 
 /* ==========================================================================
    PANTALLA 5: BUSQUEDA POR DOCUMENTO O PRUEBA (§8.5)
@@ -3711,9 +4346,16 @@ function renderizarPantallaGestion() {
   const e2eList = catalogo.e2e || [];
   const modulos = catalogo.modulos || [];
   const areas = catalogo.areas || [];
-  const resultadosCiclo = Array.from(AppState.resultadosVigentes.values());
 
-  // 1. Estatus general de las pruebas por modulo SAP
+  // Todos los reportes ejecutados (histórico consolidado del ciclo)
+  const todosLosReportes = [];
+  AppState.historialPorObjeto.forEach(arr => {
+    if (Array.isArray(arr)) {
+      arr.forEach(r => todosLosReportes.push(r));
+    }
+  });
+
+  // 1. Estatus general y Cobertura de pruebas por modulo SAP (Casos Unitarios)
   const estatusModulos = modulos.map(m => {
     const casosM = cuList.filter(c => c.modulo === m.key);
     const total = casosM.length;
@@ -3727,22 +4369,26 @@ function renderizarPantallaGestion() {
       else if (est === 'NO_APLICA') na++;
       else pend++;
     });
-    const ejecutadas = total - pend;
-    const pctAvance = total ? ((ejecutadas / total) * 100).toFixed(1) : '0.0';
+    const cubiertas = total - pend;
+    const pctCobertura = total ? ((cubiertas / total) * 100).toFixed(1) : '0.0';
     const pctAprobacion = total ? ((ok / total) * 100).toFixed(1) : '0.0';
     const incsAbiertas = (AppState.incidencias || []).filter(i => i.modulo === m.key && i.estado !== 'CERRADA' && i.estado !== 'DESCARTADA').length;
+
+    // Reportes totales (todas las ejecuciones realizadas en casos de este módulo)
+    const reportesTotales = casosM.reduce((acc, c) => acc + (AppState.historialPorObjeto.get(c.id) || []).length, 0);
 
     return {
       key: m.key,
       nombre: m.nombre,
       total,
+      cubiertas,
+      pctCobertura,
+      reportesTotales,
       ok,
       nok,
       bloq,
       na,
       pend,
-      ejecutadas,
-      pctAvance,
       pctAprobacion,
       incsAbiertas
     };
@@ -3751,11 +4397,11 @@ function renderizarPantallaGestion() {
   // 2. Reporte por area ejecutora y equipo TI
   const usuariosTI = LISTA_USUARIOS_SIMULADOS.filter(u => u.rol === 'EQUIPO_PROYECTO');
   const emailsTI = usuariosTI.map(u => u.email.toLowerCase());
-  const reportesGenTI = resultadosCiclo.filter(r => emailsTI.includes(String(r.email).toLowerCase()));
+  const reportesGenTI = todosLosReportes.filter(r => emailsTI.includes(String(r.email).toLowerCase()));
   let usersTIActivos = 0;
   let usersTISinReportes = 0;
   usuariosTI.forEach(u => {
-    const tiene = resultadosCiclo.some(r => String(r.email).toLowerCase() === u.email.toLowerCase());
+    const tiene = todosLosReportes.some(r => String(r.email).toLowerCase() === u.email.toLowerCase());
     if (tiene) usersTIActivos++;
     else usersTISinReportes++;
   });
@@ -3800,13 +4446,13 @@ function renderizarPantallaGestion() {
     });
     const pctCobertura = totalEsc ? ((escCubiertos / totalEsc) * 100).toFixed(1) : '0.0';
 
-    // Key-Users asignados nominalmente a esta area funcional (por área declarada o departamento)
+    // Key-Users asignados nominalmente a esta area funcional
     const usuariosA = LISTA_USUARIOS_SIMULADOS.filter(u => {
       if (u.rol !== 'KEY_USER') return false;
       return usuarioPerteneceAArea(u.email, a.key);
     });
 
-    const reportesGen = resultadosCiclo.filter(r => usuarioPerteneceAArea(r.email, a.key));
+    const reportesGen = todosLosReportes.filter(r => usuarioPerteneceAArea(r.email, a.key));
     const volGenerado = reportesGen.length;
     const volAsignada = reportesGen.filter(r => r.alcance === 'ASIGNADA').length;
     const volApoyo = reportesGen.filter(r => r.alcance === 'APOYO').length;
@@ -3814,7 +4460,7 @@ function renderizarPantallaGestion() {
     let usersActivos = 0;
     let usersSinReportes = 0;
     usuariosA.forEach(u => {
-      const tiene = resultadosCiclo.some(r => String(r.email).toLowerCase() === u.email.toLowerCase());
+      const tiene = todosLosReportes.some(r => String(r.email).toLowerCase() === u.email.toLowerCase());
       if (tiene) usersActivos++;
       else usersSinReportes++;
     });
@@ -3840,37 +4486,85 @@ function renderizarPantallaGestion() {
   const tablaReporteAreas = [filaTI, ...reporteAreas];
 
   // 3. Seguimiento individual de usuarios (para detectar quien no esta reportando)
-  const conteoPorEmail = new Map();
-  const ultimoPorEmail = new Map();
-
-  resultadosCiclo.forEach(r => {
-    const em = String(r.email).toLowerCase();
-    conteoPorEmail.set(em, (conteoPorEmail.get(em) || 0) + 1);
-    if (!ultimoPorEmail.has(em) || r.ts > ultimoPorEmail.get(em)) {
-      ultimoPorEmail.set(em, r.ts);
-    }
-  });
-
   const emailsVistos = new Set();
   const todosUsuarios = [];
   LISTA_USUARIOS_SIMULADOS.forEach(u => {
     const em = String(u.email || '').toLowerCase().trim();
     if (!em) return;
-    // Excluir aliases secundarios para no duplicar a Gabriel Salinas
     if (em === 'gsalinas@pjportland.com' || em === 'garfiohook@gmail.com') return;
-    if (emailsVistos.has(em)) return; // Protección estricta contra correos duplicados
+    if (emailsVistos.has(em)) return;
     emailsVistos.add(em);
     todosUsuarios.push(u);
   });
+
   const usuariosDetalle = todosUsuarios.map(u => {
     const emailLower = u.email.toLowerCase();
-    const cantReportes = conteoPorEmail.get(emailLower) || 0;
-    const ultimoTs = ultimoPorEmail.get(emailLower) || null;
+    const rol = u.rol;
+
+    // Pruebas asignadas al usuario
+    let pruebasAsignadas = [];
+    let etiquetaAmbito = '';
+    if (rol === 'LIDER') {
+      pruebasAsignadas = [...cuList.map(c => c.id), ...e2eList.map(e => e.codigo)];
+      etiquetaAmbito = '320 pruebas (Líder)';
+    } else if (rol === 'EQUIPO_PROYECTO') {
+      const modulosUser = (u.modulos || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+      if (modulosUser.length > 0) {
+        pruebasAsignadas = cuList.filter(c => modulosUser.includes(String(c.modulo).toUpperCase())).map(c => c.id);
+        etiquetaAmbito = `${pruebasAsignadas.length} CU (${modulosUser.join(', ')})`;
+      } else {
+        pruebasAsignadas = cuList.map(c => c.id);
+        etiquetaAmbito = '296 Casos CU';
+      }
+    } else {
+      // KEY_USER
+      const e2eAsig = e2eList.filter(e => (e.areas || []).some(area => usuarioPerteneceAArea(emailLower, area))).map(e => e.codigo);
+      const modulosUser = (u.modulos || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+      const cuAsig = modulosUser.length > 0 ? cuList.filter(c => modulosUser.includes(String(c.modulo).toUpperCase())).map(c => c.id) : [];
+      pruebasAsignadas = [...e2eAsig, ...cuAsig];
+      if (e2eAsig.length > 0 && cuAsig.length > 0) {
+        etiquetaAmbito = `${e2eAsig.length} E2E + ${cuAsig.length} CU`;
+      } else if (e2eAsig.length > 0) {
+        etiquetaAmbito = `${e2eAsig.length} Escenarios E2E`;
+      } else if (cuAsig.length > 0) {
+        etiquetaAmbito = `${cuAsig.length} Casos CU`;
+      } else {
+        etiquetaAmbito = 'General / Apoyo';
+      }
+    }
+
+    // Reportes del usuario
+    const reportesUser = todosLosReportes.filter(r => String(r.email).toLowerCase() === emailLower);
+    const cantReportesTotales = reportesUser.length;
+    const cantAsignadas = reportesUser.filter(r => r.alcance === 'ASIGNADA').length;
+    const cantApoyo = reportesUser.filter(r => r.alcance === 'APOYO').length;
+
+    // Cobertura calculada estrictamente sobre las pruebas asignadas
+    const objetosReportados = new Set(reportesUser.map(r => r.objeto));
+    let asignadasCubiertas = 0;
+    pruebasAsignadas.forEach(cod => {
+      if (objetosReportados.has(cod)) asignadasCubiertas++;
+    });
+
+    const totalAsignadas = pruebasAsignadas.length;
+    const pctCobertura = totalAsignadas > 0 ? ((asignadasCubiertas / totalAsignadas) * 100).toFixed(1) : (cantReportesTotales > 0 ? '100.0' : '0.0');
+
+    let ultimoTs = null;
+    reportesUser.forEach(r => {
+      if (!ultimoTs || r.ts > ultimoTs) ultimoTs = r.ts;
+    });
+
     return {
       ...u,
-      cantReportes,
+      totalAsignadas,
+      asignadasCubiertas,
+      pctCobertura,
+      etiquetaAmbito,
+      cantReportesTotales,
+      cantAsignadas,
+      cantApoyo,
       ultimoTs,
-      tieneReportes: cantReportes > 0
+      tieneReportes: cantReportesTotales > 0
     };
   });
 
@@ -3898,8 +4592,8 @@ function renderizarPantallaGestion() {
     }
     return true;
   }).sort((a, b) => {
-    if (a.cantReportes === 0 && b.cantReportes > 0) return -1;
-    if (a.cantReportes > 0 && b.cantReportes === 0) return 1;
+    if (a.cantReportesTotales === 0 && b.cantReportesTotales > 0) return -1;
+    if (a.cantReportesTotales > 0 && b.cantReportesTotales === 0) return 1;
     return a.nombre.localeCompare(b.nombre);
   });
 
@@ -3942,8 +4636,8 @@ function renderizarPantallaGestion() {
 
         <div class="tarjeta-kpi">
           <div class="tarjeta-kpi-titulo">Volumen de Reportes</div>
-          <div class="tarjeta-kpi-valor" style="color: var(--color-bloque-cu);">${resultadosCiclo.length}</div>
-          <div class="tarjeta-kpi-detalle">Total reportes en ciclo vigente</div>
+          <div class="tarjeta-kpi-valor" style="color: var(--color-bloque-cu);">${todosLosReportes.length}</div>
+          <div class="tarjeta-kpi-detalle">Total ejecuciones en ciclo vigente</div>
         </div>
       </div>
 
@@ -3963,7 +4657,7 @@ function renderizarPantallaGestion() {
           1. Estatus General de Pruebas por Modulo SAP (296 Casos Unitarios)
         </h2>
         <p style="font-size: 12px; color: var(--texto-secundario); margin-bottom: 12px;">
-          Distribucion del resultado vigente y avance de ejecucion para cada modulo SAP del Bloque 1.
+          Distribución de cobertura de casos únicos y total de reportes ejecutados para cada módulo SAP.
         </p>
 
         <div style="overflow-x: auto;">
@@ -3972,15 +4666,17 @@ function renderizarPantallaGestion() {
               <tr>
                 <th style="width: 80px;">Modulo</th>
                 <th>Nombre del Modulo</th>
-                <th style="width: 70px; text-align: center;">Total</th>
-                <th style="width: 60px; text-align: center;">OK</th>
-                <th style="width: 60px; text-align: center;">NOK</th>
-                <th style="width: 70px; text-align: center;">Bloq</th>
-                <th style="width: 70px; text-align: center;">N/A</th>
-                <th style="width: 80px; text-align: center;">Pend</th>
-                <th style="width: 90px; text-align: center;">Avance %</th>
-                <th style="width: 130px;">Barra de Avance</th>
-                <th style="width: 80px; text-align: center;">Incs</th>
+                <th style="width: 70px; text-align: center;">Total Casos</th>
+                <th style="width: 90px; text-align: center;">Cobertura</th>
+                <th style="width: 90px; text-align: center;">Cobertura %</th>
+                <th style="width: 110px; text-align: center;">Reportes Totales</th>
+                <th style="width: 50px; text-align: center;">OK</th>
+                <th style="width: 50px; text-align: center;">NOK</th>
+                <th style="width: 50px; text-align: center;">Bloq</th>
+                <th style="width: 50px; text-align: center;">N/A</th>
+                <th style="width: 55px; text-align: center;">Pend</th>
+                <th style="width: 100px;">Barra</th>
+                <th style="width: 60px; text-align: center;">Incs</th>
               </tr>
             </thead>
             <tbody>
@@ -3994,14 +4690,16 @@ function renderizarPantallaGestion() {
                     <td><span class="badge-modulo" style="font-size: 11px;">${m.key}</span></td>
                     <td><strong>${m.nombre}</strong></td>
                     <td style="text-align: center;"><strong>${m.total}</strong></td>
+                    <td style="text-align: center;"><strong style="color: var(--estado-ok);">${m.cubiertas}</strong> / ${m.total}</td>
+                    <td style="text-align: center;"><strong>${m.pctCobertura}%</strong></td>
+                    <td style="text-align: center;"><strong style="color: var(--color-bloque-cu); font-size: 13px;">${m.reportesTotales}</strong> rep.</td>
                     <td style="text-align: center;"><span style="color: var(--estado-ok); font-weight: 700;">${m.ok}</span></td>
                     <td style="text-align: center;"><span style="color: var(--estado-nok); font-weight: 700;">${m.nok}</span></td>
                     <td style="text-align: center;"><span style="color: var(--estado-bloqueado); font-weight: 700;">${m.bloq}</span></td>
                     <td style="text-align: center;"><span style="color: var(--estado-no-aplica); font-weight: 700;">${m.na}</span></td>
                     <td style="text-align: center; color: #64748b;">${m.pend}</td>
-                    <td style="text-align: center;"><strong>${m.pctAvance}%</strong></td>
                     <td>
-                      <div class="barra-pista" style="height: 10px;">
+                      <div class="barra-pista" style="height: 8px;">
                         <div style="width: ${pOK}%; background-color: var(--estado-ok);" title="OK: ${m.ok}"></div>
                         <div style="width: ${pNOK}%; background-color: var(--estado-nok);" title="NOK: ${m.nok}"></div>
                         <div style="width: ${pBloq}%; background-color: var(--estado-bloqueado);" title="Bloqueado: ${m.bloq}"></div>
@@ -4025,22 +4723,22 @@ function renderizarPantallaGestion() {
           2. Reporte por Area Ejecutora y Cobertura de Escenarios
         </h2>
         <p style="font-size: 12px; color: var(--texto-secundario); margin-bottom: 12px;">
-          Volumen generado por cada area y equipo TI, cobertura de pruebas asignadas y dotacion de usuarios.
+          Volumen de reportes totales generados por cada área y equipo TI, cobertura de pruebas asignadas y dotación de usuarios.
         </p>
 
         <div style="overflow-x: auto;">
           <table class="tabla-pruebas">
             <thead>
               <tr>
-                <th style="width: 150px;">Area / Equipo</th>
+                <th style="width: 140px;">Area / Equipo</th>
                 <th style="width: 140px;">Ambito Asignado</th>
-                <th style="width: 90px; text-align: center;">Cubiertas</th>
+                <th style="width: 90px; text-align: center;">Pruebas Cubiertas</th>
                 <th style="width: 100px; text-align: center;">Cobertura %</th>
-                <th style="width: 120px; text-align: center;">Reportes Hechos</th>
-                <th style="width: 100px; text-align: center;">(Asig / Apoyo)</th>
+                <th style="width: 120px; text-align: center;">Reportes Totales</th>
+                <th style="width: 110px; text-align: center;">(Asig / Apoyo)</th>
                 <th style="width: 90px; text-align: center;">Dotacion</th>
                 <th style="width: 110px; text-align: center;">Activos / Inactivos</th>
-                <th style="width: 110px;">Accion</th>
+                <th style="width: 100px;">Accion</th>
               </tr>
             </thead>
             <tbody>
@@ -4089,10 +4787,10 @@ function renderizarPantallaGestion() {
         <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 12px;">
           <div>
             <h2 style="font-size: 15px; font-weight: 700; color: #1e293b;">
-              3. Detalle de Usuarios y Control de Reportes (${usuariosFiltrados.length} usuarios)
+              3. Detalle de Usuarios: Cobertura Asignada y Reportes (${usuariosFiltrados.length} usuarios)
             </h2>
             <div style="font-size: 12px; color: var(--texto-secundario); margin-top: 2px;">
-              Visualice que usuarios especificos no han registrado actividad de pruebas en el ciclo actual.
+              La cobertura se calcula estrictamente sobre las pruebas asignadas a cada usuario, mostrando también los reportes totales realizados.
             </div>
           </div>
 
@@ -4128,19 +4826,21 @@ function renderizarPantallaGestion() {
               <tr>
                 <th>Nombre del Ejecutor</th>
                 <th>Correo Corporativo</th>
-                <th style="width: 80px;">Sociedad</th>
-                <th style="width: 140px;">Rol / Departamento</th>
-                <th>Areas / Modulos Asignados</th>
-                <th style="width: 110px; text-align: center;">Pruebas Reportadas</th>
-                <th style="width: 130px; text-align: center;">Estatus Reporte</th>
-                <th style="width: 140px;">Ultimo Reporte</th>
-                <th style="width: 110px; text-align: center;">Certificado</th>
+                <th style="width: 75px;">Sociedad</th>
+                <th style="width: 120px;">Rol / Departamento</th>
+                <th style="width: 130px;">Ambito Asignado</th>
+                <th style="width: 125px; text-align: center;">Cobertura Asignada</th>
+                <th style="width: 120px; text-align: center;">Reportes Totales</th>
+                <th style="width: 95px; text-align: center;">(Asig / Apoyo)</th>
+                <th style="width: 105px; text-align: center;">Estatus</th>
+                <th style="width: 120px;">Ultimo Reporte</th>
+                <th style="width: 100px; text-align: center;">Certificado</th>
               </tr>
             </thead>
             <tbody>
               ${usuariosFiltrados.length === 0 ? `
                 <tr>
-                  <td colspan="9" style="text-align: center; padding: 24px; color: var(--texto-atenuado);">
+                  <td colspan="11" style="text-align: center; padding: 24px; color: var(--texto-atenuado);">
                     No hay usuarios que coincidan con los filtros seleccionados.
                   </td>
                 </tr>
@@ -4163,36 +4863,43 @@ function renderizarPantallaGestion() {
                     ` : `
                       <span style="font-size: 11px; color: #475569;">Key-User</span>
                     `}
+                    ${u.departamento ? `<div style="font-size: 10px; color: #64748b; margin-top: 2px;">${u.departamento}</div>` : ''}
                   </td>
-                  <td>
-                    ${u.rol === 'EQUIPO_PROYECTO' ? `
-                      <div style="font-size: 11px; font-weight: 700; color: #16337A;">
-                        ${u.cargo || 'Consultor TI'} ${u.departamento ? `· Depto: ${u.departamento}` : ''}
-                      </div>
-                      <div style="font-size: 10px; color: #475569; margin-top: 2px;">
-                        Módulos: ${u.modulos || 'MM, SD, FICO, EWM, CFG'}
-                      </div>
-                    ` : u.rol === 'LIDER' ? `
-                      <div style="font-size: 11px; font-weight: 700; color: #0284c7;">
-                        Líder de Implementación SAP (Gestión General y Soporte)
-                      </div>
-                    ` : `
-                      <div style="font-size: 11px; color: #334155;">
+                  <td style="font-size: 11px; color: #334155;">
+                    <div><strong>${u.etiquetaAmbito}</strong></div>
+                    ${u.areas ? `
+                      <div style="margin-top: 2px;">
                         ${(u.areas || '').split(',').map(s => s.trim()).filter(Boolean).map(a => `
-                          <span class="badge-area" style="background-color: var(--color-bloque-cu); font-size: 10px; margin-right: 2px;">${a}</span>
-                        `).join('') || '<span class="texto-vacio">Todas</span>'}
+                          <span class="badge-area" style="background-color: var(--color-bloque-cu); font-size: 9px; margin-right: 2px;">${a}</span>
+                        `).join('')}
                       </div>
-                      ${u.cargo ? `<div style="font-size: 10px; color: #64748b; margin-top: 2px;">${u.cargo}</div>` : ''}
+                    ` : ''}
+                  </td>
+                  <td style="text-align: center;">
+                    ${u.totalAsignadas > 0 ? `
+                      <div>
+                        <strong style="color: ${u.asignadasCubiertas > 0 ? 'var(--estado-ok)' : '#94a3b8'};">
+                          ${u.asignadasCubiertas} / ${u.totalAsignadas}
+                        </strong>
+                        <span style="font-size: 11px; font-weight: 600; margin-left: 4px;">(${u.pctCobertura}%)</span>
+                      </div>
+                      <div class="barra-pista" style="height: 5px; margin-top: 3px;"><div style="width: ${u.pctCobertura}%; background-color: var(--estado-ok);"></div></div>
+                    ` : `
+                      <span style="color: #64748b; font-size: 11px;">${u.pctCobertura}% (Apoyo)</span>
                     `}
                   </td>
                   <td style="text-align: center;">
-                    <strong style="font-size: 14px; color: ${u.cantReportes > 0 ? 'var(--color-bloque-cu)' : '#991b1b'};">
-                      ${u.cantReportes}
+                    <strong style="font-size: 14px; color: ${u.cantReportesTotales > 0 ? 'var(--color-bloque-cu)' : '#991b1b'};">
+                      ${u.cantReportesTotales}
                     </strong>
+                    <span style="font-size: 11px; color: #64748b;"> rep.</span>
+                  </td>
+                  <td style="text-align: center; font-size: 11px; color: #64748b;">
+                    ${u.cantAsignadas} / <span style="color: #b45309; font-weight: 600;">${u.cantApoyo}</span>
                   </td>
                   <td style="text-align: center;">
                     ${u.tieneReportes 
-                      ? `<span class="badge-activo">✓ Activo (${u.cantReportes})</span>`
+                      ? `<span class="badge-activo">✓ Activo</span>`
                       : `<span class="badge-alerta-inactivo">⚠️ Sin reportes</span>`}
                   </td>
                   <td>
@@ -5068,6 +5775,7 @@ function enlazarEventosVista() {
   if (AppState.modalReporteAbierto) enlazarEventosModalReportar();
   if (AppState.modalAgregarDocAbierto) enlazarEventosModalDoc();
   if (AppState.modalIncidenciaAbierto) enlazarEventosModalGestionIncidencia();
+  if (AppState.modalEditarReporteAbierto) enlazarEventosModalEditarReporte();
 }
 
 window.addEventListener('DOMContentLoaded', inicializarApp);
