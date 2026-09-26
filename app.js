@@ -892,7 +892,15 @@ const MockApi = (function() {
           return `${label} ${d.numero}`;
         }).join(' · ');
 
+        const correlativoRes = resultados.length + 1;
+        const idResultadoCreado = 'RES-' + String(correlativoRes).padStart(4, '0');
+
+        if (datos.resultado === 'NOK' && datos.incidencia && datos.incidencia.titulo) {
+          datos.comentario = datos.incidencia.titulo;
+        }
+
         let idIncidenciaCreada = null;
+        let nuevaInc = null;
         if (datos.resultado === 'NOK' && datos.incidencia) {
           const correlativoInc = incidencias.length + 1;
           idIncidenciaCreada = 'INC-' + String(correlativoInc).padStart(4, '0');
@@ -906,7 +914,14 @@ const MockApi = (function() {
             }
           }
 
-          const nuevaInc = {
+          let urlEvidenciaInc = '';
+          if (datos.archivoEvidencia) {
+            const ext = (datos.archivoEvidencia.nombre || '').toLowerCase().endsWith('.doc') ? '.doc' : '.docx';
+            const nomUser = (perfil.nombre || perfil.email || 'USUARIO').trim().replace(/[\s\t\n]+/g, '_').toUpperCase();
+            urlEvidenciaInc = `https://drive.google.com/drive/folders/Incidentes/${idIncidenciaCreada}_${nomUser}${ext}`;
+          }
+
+          nuevaInc = {
             id: idIncidenciaCreada,
             ts_alta: new Date().toISOString().replace('T', ' ').substring(0, 19),
             tipo: datos.tipo,
@@ -924,15 +939,26 @@ const MockApi = (function() {
             ts_cierre: null,
             resolucion: null,
             ciclo: config.ciclo_activo,
-            golive: config.golive_activo
+            golive: config.golive_activo,
+            evidencia: urlEvidenciaInc
           };
           incidencias.push(nuevaInc);
           guardarColeccion(STORAGE_KEYS.INCIDENCIAS, incidencias);
         }
 
-        // Crear registro en RESULTADOS (append-only)
+        let urlEvidenciaRes = '';
+        if (datos.archivoEvidencia) {
+          const esNOK = datos.resultado === 'NOK';
+          const carpeta = esNOK ? 'Incidentes' : 'Resultados';
+          const ext = (datos.archivoEvidencia.nombre || '').toLowerCase().endsWith('.doc') ? '.doc' : '.docx';
+          const nomUser = (perfil.nombre || perfil.email || 'USUARIO').trim().replace(/[\s\t\n]+/g, '_').toUpperCase();
+          const cod = esNOK ? idIncidenciaCreada : idResultadoCreado;
+          urlEvidenciaRes = `https://drive.google.com/drive/folders/${carpeta}/${cod}_${nomUser}${ext}`;
+        }
+
+        // Crear registro en RESULTADOS (append-only con número único)
         const nuevoResultado = {
-          id: datos.id,
+          id: idResultadoCreado,
           ts: new Date().toISOString().replace('T', ' ').substring(0, 19),
           tipo: datos.tipo,
           objeto: datos.objeto,
@@ -945,7 +971,8 @@ const MockApi = (function() {
           ciclo: config.ciclo_activo,
           golive: config.golive_activo,
           ambiente: config.ambiente,
-          incidencia: idIncidenciaCreada
+          incidencia: idIncidenciaCreada,
+          evidencia: urlEvidenciaRes
         };
 
         resultados.push(nuevoResultado);
@@ -956,7 +983,7 @@ const MockApi = (function() {
           const correlativoDoc = documentos.length + 1;
           const nuevoDoc = {
             id: 'D-' + String(correlativoDoc).padStart(6, '0'),
-            resultado_id: datos.id,
+            resultado_id: idResultadoCreado,
             tipo: d.tipo,
             numero: String(d.numero || '').trim(), // Texto estricto
             sociedad: d.sociedad || perfil.sociedad || 'CL11',
@@ -985,8 +1012,9 @@ const MockApi = (function() {
         guardarColeccion(STORAGE_KEYS.BITACORA, bitacora);
 
         return {
-          id: datos.id,
-          incidencia: idIncidenciaCreada,
+          id: idResultadoCreado,
+          resultado: nuevoResultado,
+          incidencia: nuevaInc,
           documentos: docsLista.length
         };
       }
@@ -1291,6 +1319,7 @@ function normalizarIncidencia(inc) {
   inc.reporta = inc.reporta || '';
   inc.asignada_a = inc.asignada_a || '';
   inc.modulo = inc.modulo || 'MM';
+  inc.evidencia = inc.evidencia || '';
 
   let tx = String(inc.transaccion || '').trim().toUpperCase();
   let soc = String(inc.sociedad || '').trim().toUpperCase();
@@ -1330,7 +1359,8 @@ function normalizarIncidencia(inc) {
 async function sincronizarEstadoServidor() {
   try {
     const data = await api('estado', {});
-    const resultados = data.resultados || [];
+    if (!data) return;
+    const resultados = Array.isArray(data.resultados) ? data.resultados : [];
     
     AppState.resultadosVigentes.clear();
     AppState.historialPorObjeto.clear();
@@ -1398,6 +1428,12 @@ function procesarHashRuta() {
     const codigo = hash.substring(8);
     AppState.pruebaSeleccionada = codigo;
     AppState.vista = 'ficha';
+  } else if (hash === '#pruebas/todas') {
+    AppState.vista = 'pruebas';
+    AppState.subvistaPruebas = 'todas';
+  } else if (hash === '#pruebas/mis') {
+    AppState.vista = 'pruebas';
+    AppState.subvistaPruebas = 'mis';
   } else if (hash === '#incidencias') {
     AppState.vista = 'incidencias';
     if (!AppState.incidencias || AppState.incidencias.length === 0) {
@@ -1456,6 +1492,7 @@ async function iniciarSesion(email) {
     };
     localStorage.setItem('portland_sap_sesion', JSON.stringify(AppState.sesion));
 
+    AppState.subvistaPruebas = 'mis';
     await sincronizarEstadoServidor();
     window.location.hash = '#pruebas';
   } catch (err) {
@@ -1749,12 +1786,12 @@ function obtenerResultadoVigenteUsuario(codigo, perfil) {
   const emailNorm = String(perfil.email || '').toLowerCase().trim();
   const hist = AppState.historialPorObjeto.get(codigo) || [];
 
-  // Si es Líder y está en vista global 'todas', retorna el último resultado general
-  if (perfil.rol === 'LIDER' && AppState.subvistaPruebas === 'todas') {
+  // En la vista general 'todas', retorna el último resultado vigente general registrado en el catálogo
+  if (AppState.subvistaPruebas === 'todas') {
     return AppState.resultadosVigentes.get(codigo) || null;
   }
 
-  // Buscar cronológicamente el último reporte de este usuario
+  // En la vista 'mis', buscar cronológicamente el último reporte de este usuario
   for (let i = hist.length - 1; i >= 0; i--) {
     if (String(hist[i].email || '').toLowerCase().trim() === emailNorm) {
       return hist[i];
@@ -1779,13 +1816,9 @@ function obtenerPruebasFiltradas() {
   const SOCIEDADES_SIN_DOTACION = ['CL15', 'CL16'];
 
   return todas.filter(item => {
-    // 1. Cada usuario debe poder ver únicamente sus propias pruebas (salvo Líder en vista 'todas')
-    if (perfil.rol !== 'LIDER') {
+    // 1. En vista 'mis pruebas', cada usuario ve únicamente su plan asignado. En 'todas', ve los 320 casos.
+    if (AppState.subvistaPruebas === 'mis') {
       if (!esPruebaAsignadaAUsuario(item, perfil)) return false;
-    } else {
-      if (AppState.subvistaPruebas === 'mis' && !esPruebaAsignadaAUsuario(item, perfil)) {
-        return false;
-      }
     }
 
     // 2. Filtro de tipo
@@ -1879,30 +1912,21 @@ function renderizarPantallaPruebas() {
   return `
     <div class="panel-control-pruebas">
       <div class="fila-selector-alcance">
-        ${esLider ? `
-          <div class="selector-alcance">
-            <button class="btn-alcance ${AppState.subvistaPruebas === 'mis' ? 'activo' : ''}" id="btn-switch-mis">
-              Mis pruebas
-            </button>
-            <button class="btn-alcance ${AppState.subvistaPruebas === 'todas' ? 'activo' : ''}" id="btn-switch-todas">
-              Todas las pruebas (320)
-            </button>
-          </div>
-          <div class="resumen-alcance-info">
-            ${AppState.subvistaPruebas === 'mis' 
-              ? `Mostrando su asignación predeterminada (${perfil.areas || perfil.modulos || 'Todo'})`
-              : 'Mostrando las 320 pruebas del plan (Vista Global de Líder).'}
-          </div>
-        ` : `
-          <div class="selector-alcance">
-            <button class="btn-alcance activo" style="cursor: default;">
-              Mis pruebas asignadas (${total})
-            </button>
-          </div>
-          <div class="resumen-alcance-info">
-            Mostrando exclusivamente sus pruebas asignadas (${perfil.areas || perfil.modulos || perfil.departamento || 'Ámbito individual'}).
-          </div>
-        `}
+        <div class="selector-alcance">
+          <button class="btn-alcance ${AppState.subvistaPruebas === 'mis' ? 'activo' : ''}" id="btn-switch-mis">
+            Mis pruebas
+          </button>
+          <button class="btn-alcance ${AppState.subvistaPruebas === 'todas' ? 'activo' : ''}" id="btn-switch-todas">
+            Todas las pruebas (320)
+          </button>
+        </div>
+        <div class="resumen-alcance-info">
+          ${AppState.subvistaPruebas === 'mis' 
+            ? `Mostrando su plan de pruebas asignado (${perfil.areas || perfil.modulos || perfil.departamento || 'Plan individual'}).`
+            : (esLider
+                ? 'Mostrando las 320 pruebas del plan (Vista Global de Líder).'
+                : 'Mostrando las 320 pruebas disponibles. Puede consultar o reportar cualquier caso fuera de su plan.')}
+        </div>
 
         <div>
           <button class="btn-certificar-rapido" onclick="window.location.hash='#certificado'" title="Generar y descargar documento resumen de pruebas en PDF">
@@ -1951,7 +1975,6 @@ function renderizarPantallaPruebas() {
             <option value="PENDIENTE" ${AppState.filtros.estado === 'PENDIENTE' ? 'selected' : ''}>Pendiente</option>
             <option value="OK" ${AppState.filtros.estado === 'OK' ? 'selected' : ''}>OK</option>
             <option value="NOK" ${AppState.filtros.estado === 'NOK' ? 'selected' : ''}>NOK</option>
-            <option value="BLOQUEADO" ${AppState.filtros.estado === 'BLOQUEADO' ? 'selected' : ''}>Bloqueado</option>
             <option value="NO_APLICA" ${AppState.filtros.estado === 'NO_APLICA' ? 'selected' : ''}>No aplica</option>
           </select>
         </div>
@@ -1991,7 +2014,7 @@ function renderizarPantallaPruebas() {
           <input type="text" id="filtro-texto" class="form-input" placeholder="Codigo, transaccion, nombre..." value="${AppState.filtros.texto}">
         </div>
 
-        ${esLider && AppState.subvistaPruebas === 'todas' ? `
+        ${AppState.subvistaPruebas === 'todas' ? `
           <label class="filtro-check" title="Muestra pruebas de areas o sociedades que carecen de Key-User nominal">
             <input type="checkbox" id="check-sin-dotacion" ${AppState.filtros.sin_dotacion ? 'checked' : ''}>
             Sin dotacion
@@ -2024,14 +2047,19 @@ function renderizarPantallaPruebas() {
             </tr>
           ` : pruebas.map(item => {
             const rPropio = obtenerResultadoVigenteUsuario(item._codigo, perfil);
-            const vig = rPropio || (esLider && AppState.subvistaPruebas === 'todas' ? AppState.resultadosVigentes.get(item._codigo) : null);
+            const vig = (AppState.subvistaPruebas === 'todas') 
+              ? (AppState.resultadosVigentes.get(item._codigo) || rPropio) 
+              : rPropio;
             const estado = vig ? vig.resultado : 'PENDIENTE';
 
             const todosDocsObj = AppState.documentosPorObjeto.get(item._codigo) || [];
-            const docsUsuario = esLider ? todosDocsObj : todosDocsObj.filter(d => String(d.email || '').toLowerCase().trim() === emailActual);
+            const docsUsuario = (esLider || AppState.subvistaPruebas === 'todas') 
+              ? todosDocsObj 
+              : todosDocsObj.filter(d => String(d.email || '').toLowerCase().trim() === emailActual);
             const docsCount = docsUsuario.length;
             
             const esSinDueno = ['E2E-06', 'E2E-07', 'E2E-09', 'E2E-10'].includes(item._codigo);
+            const esAsignada = esPruebaAsignadaAUsuario(item, perfil);
 
             return `
               <tr onclick="window.location.hash='#prueba/${item._codigo}'">
@@ -2043,7 +2071,12 @@ function renderizarPantallaPruebas() {
                 <td>
                   <strong>${item._nombre}</strong>
                   ${item.tx ? `<span style="color: #64748b; font-size: 11px; margin-left: 6px;">[Tx: ${item.tx}]</span>` : ''}
-                  ${esSinDueno && esLider ? `<span class="badge-sin-dueno">Sin ejecutor nominal</span>` : ''}
+                  ${AppState.subvistaPruebas === 'todas' && !esAsignada ? `
+                    <span class="badge-alcance-apoyo" title="Prueba fuera de su plan asignado por defecto (disponible para reporte de apoyo)">
+                      ${item._tipo === 'CU' ? `Apoyo: ${item.modulo}` : `Apoyo: ${(item.areas || []).join(', ') || 'General'}`}
+                    </span>
+                  ` : ''}
+                  ${esSinDueno && (esLider || AppState.subvistaPruebas === 'todas') ? `<span class="badge-sin-dueno">Sin ejecutor nominal</span>` : ''}
                 </td>
                 <td>
                   <span class="badge-estado estado-${estado}">${estado}</span>
@@ -2164,34 +2197,22 @@ function renderizarPantallaFicha() {
     `;
   }
 
-  // Protección de acceso: cada usuario debe poder ver únicamente sus propias pruebas
-  if (!esPruebaAsignadaAUsuario(prueba, perfil)) {
-    return `
-      <div class="contenedor-ficha">
-        <div style="background: #fff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 32px 24px; text-align: center; max-width: 520px; margin: 40px auto; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05);">
-          <div style="font-size: 36px; margin-bottom: 12px;">🔒</div>
-          <h2 style="font-size: 18px; font-weight: 700; color: #1e293b; margin-bottom: 8px;">Prueba fuera de su ámbito asignado</h2>
-          <p style="color: #64748b; font-size: 13px; margin: 0 auto 20px auto; line-height: 1.5;">
-            La prueba <strong>${prueba._codigo}</strong> no está asignada a su perfil (${perfil.areas || perfil.modulos || perfil.departamento || 'Sin asignación'}). Cada usuario solo puede ver y gestionar sus pruebas propias.
-          </p>
-          <button class="btn-primario" onclick="window.location.hash='#pruebas'" style="width: auto; padding: 8px 20px;">
-            ← Volver a mis pruebas asignadas
-          </button>
-        </div>
-      </div>
-    `;
-  }
+  const esAsignada = esPruebaAsignadaAUsuario(prueba, perfil);
 
   const vig = AppState.resultadosVigentes.get(codigo);
   const todosHistorial = AppState.historialPorObjeto.get(codigo) || [];
 
-  // Cada usuario ve únicamente su propio Historial de reportes de ejecución (Líder ve todos)
-  const historial = esLider ? todosHistorial : todosHistorial.filter(h => String(h.email || '').toLowerCase().trim() === emailActual);
+  // En vista 'todas' o para Líder, se visualiza el historial general completo. En 'mis', solo los reportes propios.
+  const verHistorialCompleto = esLider || AppState.subvistaPruebas === 'todas';
+  const historial = verHistorialCompleto ? todosHistorial : todosHistorial.filter(h => String(h.email || '').toLowerCase().trim() === emailActual);
 
   const rPropio = obtenerResultadoVigenteUsuario(codigo, perfil);
-  const estadoActual = rPropio ? rPropio.resultado : (esLider && AppState.subvistaPruebas === 'todas' && vig ? vig.resultado : 'PENDIENTE');
+  const estadoActual = (AppState.subvistaPruebas === 'todas' && vig)
+    ? vig.resultado
+    : (rPropio ? rPropio.resultado : (vig ? vig.resultado : 'PENDIENTE'));
 
-  const docs = AppState.documentosPorObjeto.get(codigo) || [];
+  const todosDocs = AppState.documentosPorObjeto.get(codigo) || [];
+  const docs = verHistorialCompleto ? todosDocs : todosDocs.filter(d => String(d.email || '').toLowerCase().trim() === emailActual);
 
   return `
     <div class="contenedor-ficha">
@@ -2202,8 +2223,13 @@ function renderizarPantallaFicha() {
             <span class="badge-codigo ${prueba._tipo === 'CU' ? 'badge-cu' : 'badge-e2e'}">${prueba._codigo}</span>
             <span class="badge-estado estado-${estadoActual}">${estadoActual}</span>
             ${prueba.golive ? `<span class="badge-codigo" style="background: #f1f5f9;">${prueba.golive}</span>` : ''}
+            ${!esAsignada ? `
+              <span class="badge-alcance-apoyo" style="font-size: 11px; padding: 2px 7px;" title="Esta prueba está fuera de su plan asignado. Si reporta un resultado, se registrará automáticamente como APOYO.">
+                🤝 Caso fuera de su plan (Apoyo)
+              </span>
+            ` : ''}
             <span style="font-size: 11px; color: #16a34a; font-weight: 600; margin-left: 6px; display: inline-flex; align-items: center; gap: 4px;">
-              ● Activa para reportes (${historial.length} reporte${historial.length !== 1 ? 's' : ''}${!esLider ? ' propio' + (historial.length !== 1 ? 's' : '') : ''})
+              ● Activa para reportes (${historial.length} reporte${historial.length !== 1 ? 's' : ''}${!verHistorialCompleto ? ' propio' + (historial.length !== 1 ? 's' : '') : ''})
             </span>
           </div>
           <h1 class="ficha-nombre">${prueba._nombre}</h1>
@@ -2341,10 +2367,10 @@ function renderizarPantallaFicha() {
       <div class="seccion-ficha">
         <div class="seccion-titulo">
           Historial de reportes de ejecucion (${historial.length})
-          ${!esLider ? '<span style="font-size: 11px; font-weight: normal; color: #64748b; margin-left: 8px;">(Mostrando únicamente sus reportes propios)</span>' : ''}
+          ${!verHistorialCompleto ? '<span style="font-size: 11px; font-weight: normal; color: #64748b; margin-left: 8px;">(Mostrando únicamente sus reportes propios)</span>' : ''}
         </div>
         ${historial.length === 0 ? `
-          <p class="texto-vacio">Usted aún no cuenta con reportes registrados para esta prueba en el ciclo activo.</p>
+          <p class="texto-vacio">${verHistorialCompleto ? 'Aún no se han registrado reportes para esta prueba en el ciclo activo.' : 'Usted aún no cuenta con reportes registrados para esta prueba en el ciclo activo.'}</p>
         ` : `
           <table class="tabla-historial">
             <thead>
@@ -2375,6 +2401,13 @@ function renderizarPantallaFicha() {
                         <div style="margin-top: 4px; display: flex; align-items: center; gap: 8px;">
                           <a href="#incidencias" style="color: #b71c1c; font-weight: 700;">Incidencia: ${h.incidencia}</a>
                           ${esLider ? `<button type="button" class="btn-secundario btn-abrir-gestion-inc" data-id="${h.incidencia}" style="padding: 2px 6px; font-size: 10px;">Gestionar</button>` : ''}
+                        </div>
+                      ` : ''}
+                      ${h.evidencia ? `
+                        <div style="margin-top: 5px;">
+                          <a href="${h.evidencia}" target="_blank" rel="noopener noreferrer" class="btn-link-evidencia" title="Abrir documento Word en Google Drive">
+                            📄 Evidencia Word (${h.id})
+                          </a>
                         </div>
                       ` : ''}
                     </td>
@@ -2489,6 +2522,7 @@ const FormReporte = {
   resultado: 'OK',
   pasoFalla: '',
   comentario: '',
+  archivoEvidencia: null, // { nombre, base64, mimeType, tamano }
   incidencia: {
     titulo: '',
     detalle: '',
@@ -2524,21 +2558,13 @@ function renderizarModalReportar() {
   const prueba = obtenerDetallePrueba(AppState.pruebaSeleccionada);
   const perfil = AppState.sesion.perfil;
 
-  let esApoyo = false;
+  const esAsignada = esPruebaAsignadaAUsuario(prueba, perfil);
+  const esApoyo = perfil.rol !== 'LIDER' && !esAsignada;
   let areaAsignadaTexto = '';
-  if (prueba._tipo === 'E2E') {
-    const areasPrueba = (prueba.areas || []).map(a => String(a).toUpperCase());
-    const areasUser = (perfil.areas || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
-    if (areasUser.length > 0 && !areasPrueba.some(a => areasUser.includes(a))) {
-      esApoyo = true;
-      areaAsignadaTexto = (prueba.areas || []).join(', ');
-    }
-  } else if (prueba._tipo === 'CU') {
-    const modulosUser = (perfil.modulos || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
-    if (modulosUser.length > 0 && !modulosUser.includes(String(prueba.modulo).toUpperCase())) {
-      esApoyo = true;
-      areaAsignadaTexto = `Modulo ${prueba.modulo}`;
-    }
+  if (prueba._tipo === 'CU') {
+    areaAsignadaTexto = `Módulo ${prueba.modulo}`;
+  } else if (prueba._tipo === 'E2E') {
+    areaAsignadaTexto = (prueba.areas || []).join(', ') || 'Área designada';
   }
 
   const tiposOrdenados = proponerTiposDocParaPrueba(prueba);
@@ -2558,18 +2584,15 @@ function renderizarModalReportar() {
         ` : ''}
 
         <form id="form-reporte-ejecucion" onsubmit="event.preventDefault();">
-          <!-- 4 Botones grandes de resultado -->
+          <!-- Botones de resultado (OK, NOK, No aplica) -->
           <div class="form-grupo">
             <label>Resultado de la prueba</label>
-            <div class="cuadricula-botones-resultado">
+            <div class="cuadricula-botones-resultado" style="grid-template-columns: repeat(3, 1fr);">
               <button type="button" class="btn-resultado ${FormReporte.resultado === 'OK' ? 'seleccionado-OK' : ''}" data-res="OK">
                 OK
               </button>
               <button type="button" class="btn-resultado ${FormReporte.resultado === 'NOK' ? 'seleccionado-NOK' : ''}" data-res="NOK">
                 NOK
-              </button>
-              <button type="button" class="btn-resultado ${FormReporte.resultado === 'BLOQUEADO' ? 'seleccionado-BLOQUEADO' : ''}" data-res="BLOQUEADO">
-                Bloqueado
               </button>
               <button type="button" class="btn-resultado ${FormReporte.resultado === 'NO_APLICA' ? 'seleccionado-NO_APLICA' : ''}" data-res="NO_APLICA">
                 No aplica
@@ -2592,13 +2615,15 @@ function renderizarModalReportar() {
             </div>
           ` : ''}
 
-          <!-- Comentario libre -->
-          <div class="form-grupo">
-            <label for="rep-comentario">
-              Comentario ${FormReporte.resultado !== 'OK' ? '(Obligatorio para ' + FormReporte.resultado + ') *' : '(Opcional)'}
-            </label>
-            <textarea id="rep-comentario" class="form-textarea" rows="3" placeholder="Describa lo observado, precondiciones o detalles de la ejecucion..." ${FormReporte.resultado !== 'OK' ? 'required' : ''}>${FormReporte.comentario}</textarea>
-          </div>
+          <!-- Comentario libre (Oculto en NOK: en NOK se usa automáticamente el Título de la Incidencia) -->
+          ${FormReporte.resultado !== 'NOK' ? `
+            <div class="form-grupo">
+              <label for="rep-comentario">
+                Comentario ${FormReporte.resultado === 'NO_APLICA' ? '(Obligatorio para No aplica) *' : '(Opcional)'}
+              </label>
+              <textarea id="rep-comentario" class="form-textarea" rows="3" placeholder="Describa lo observado, precondiciones o detalles de la ejecucion..." ${FormReporte.resultado === 'NO_APLICA' ? 'required' : ''}>${FormReporte.comentario}</textarea>
+            </div>
+          ` : ''}
 
           <!-- Bloque Incidencia obligatoria en caso de NOK -->
           ${FormReporte.resultado === 'NOK' ? `
@@ -2660,6 +2685,45 @@ function renderizarModalReportar() {
                     <option value="CFG" ${FormReporte.incidencia.modulo === 'CFG' ? 'selected' : ''}>CFG</option>
                   </select>
                 </div>
+              </div>
+            </div>
+          ` : ''}
+
+          <!-- Evidencia documental Word (Opcional para OK y NOK) -->
+          ${(FormReporte.resultado === 'OK' || FormReporte.resultado === 'NOK') ? `
+            <div class="form-grupo seccion-evidencia-word">
+              <label style="font-weight: 700; display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;">
+                <span>Adjuntar Evidencia de Prueba (Documento Word .docx / .doc)</span>
+                <span style="font-size: 11px; font-weight: normal; color: var(--texto-secundario);">
+                  ${FormReporte.resultado === 'OK' ? 'Carpeta Drive: <strong>Resultados</strong>' : 'Carpeta Drive: <strong>Incidentes</strong>'}
+                </span>
+              </label>
+              
+              <div class="contenedor-carga-archivo">
+                <input type="file" id="inp-archivo-evidencia" accept=".doc,.docx,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document" style="display: none;">
+                
+                ${FormReporte.archivoEvidencia ? `
+                  <div class="archivo-cargado-badge">
+                    <span style="font-size: 22px;">📄</span>
+                    <div style="flex: 1; min-width: 0;">
+                      <div style="font-weight: 700; font-size: 13px; text-overflow: ellipsis; overflow: hidden; white-space: nowrap; color: #1e3a8a;">
+                        ${FormReporte.archivoEvidencia.nombre}
+                      </div>
+                      <div style="font-size: 11px; color: var(--texto-secundario); margin-top: 2px;">
+                        ${(FormReporte.archivoEvidencia.tamano / 1024).toFixed(1)} KB · Se guardará en carpeta <strong>${FormReporte.resultado === 'OK' ? 'Resultados' : 'Incidentes'}</strong>
+                      </div>
+                    </div>
+                    <button type="button" class="btn-secundario" id="btn-quitar-archivo" style="padding: 4px 10px; font-size: 11px; color: #b91c1c; border-color: #fecaca; background: #fff5f5;">
+                      ✕ Quitar
+                    </button>
+                  </div>
+                ` : `
+                  <div class="zona-subida-drop" id="btn-seleccionar-archivo">
+                    <span style="font-size: 22px;">📎</span>
+                    <div style="font-size: 13px; font-weight: 600; color: #1e40af;">Haga clic aquí para adjuntar documento Word (.docx o .doc)</div>
+                    <div style="font-size: 11px; color: var(--texto-secundario);">Opcional · Se identificará con el código y su nombre de usuario en Google Drive</div>
+                  </div>
+                `}
               </div>
             </div>
           ` : ''}
@@ -2755,7 +2819,12 @@ function sincronizarCamposFormReporte() {
   if (pasoFalla) FormReporte.pasoFalla = pasoFalla.value;
 
   const incTit = document.getElementById('inc-titulo');
-  if (incTit) FormReporte.incidencia.titulo = incTit.value;
+  if (incTit) {
+    FormReporte.incidencia.titulo = incTit.value;
+    if (FormReporte.resultado === 'NOK') {
+      FormReporte.comentario = incTit.value;
+    }
+  }
   const incDet = document.getElementById('inc-detalle');
   if (incDet) FormReporte.incidencia.detalle = incDet.value;
   const incTx = document.getElementById('inc-transaccion');
@@ -2808,6 +2877,72 @@ function enlazarEventosModalReportar() {
   if (inpIncTit) {
     inpIncTit.addEventListener('input', (e) => {
       FormReporte.incidencia.titulo = e.target.value;
+      if (FormReporte.resultado === 'NOK') {
+        FormReporte.comentario = e.target.value;
+      }
+    });
+  }
+
+  // Manejo de archivo Word como evidencia
+  const btnSelArch = document.getElementById('btn-seleccionar-archivo');
+  const inpArch = document.getElementById('inp-archivo-evidencia');
+  const btnQuitarArch = document.getElementById('btn-quitar-archivo');
+
+  if (btnSelArch && inpArch) {
+    btnSelArch.addEventListener('click', () => inpArch.click());
+  }
+
+  if (inpArch) {
+    inpArch.addEventListener('change', (e) => {
+      const file = e.target.files && e.target.files[0];
+      if (!file) return;
+
+      const ext = file.name.split('.').pop().toLowerCase();
+      if (ext !== 'docx' && ext !== 'doc') {
+        alert('Solo se admiten documentos Word (.docx o .doc) como evidencia.');
+        inpArch.value = '';
+        return;
+      }
+
+      if (file.size > 15 * 1024 * 1024) {
+        alert('El archivo supera el límite de 15 MB para transferencia a Google Drive.');
+        inpArch.value = '';
+        return;
+      }
+
+      sincronizarCamposFormReporte();
+      const dropZone = document.getElementById('btn-seleccionar-archivo');
+      if (dropZone) {
+        dropZone.innerHTML = `
+          <span class="spinner" style="border-top-color: #1e40af; border-color: rgba(30, 64, 175, 0.2);"></span>
+          <div style="font-size: 13px; font-weight: 600; color: #1e40af;">Leyendo archivo Word...</div>
+        `;
+      }
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        const dataUrl = ev.target.result;
+        const base64 = dataUrl.split(',')[1];
+        FormReporte.archivoEvidencia = {
+          nombre: file.name,
+          mimeType: file.type || (ext === '.doc' ? 'application/msword' : 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'),
+          tamano: file.size,
+          base64: base64
+        };
+        renderizarApp();
+      };
+      reader.onerror = () => {
+        alert('Error al leer el archivo seleccionado.');
+        renderizarApp();
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+
+  if (btnQuitarArch) {
+    btnQuitarArch.addEventListener('click', () => {
+      sincronizarCamposFormReporte();
+      FormReporte.archivoEvidencia = null;
+      renderizarApp();
     });
   }
 
@@ -2969,10 +3104,11 @@ function enlazarEventosModalReportar() {
       FormReporte.incidencia.sociedad = incSoc;
       FormReporte.incidencia.severidad = document.getElementById('inc-severidad')?.value || 'MEDIA';
       FormReporte.incidencia.modulo = document.getElementById('inc-modulo')?.value || 'MM';
+      FormReporte.comentario = incTitulo;
     }
 
-    if ((FormReporte.resultado === 'BLOQUEADO' || FormReporte.resultado === 'NO_APLICA') && !comentario) {
-      alert(`Para reportar ${FormReporte.resultado} es obligatorio ingresar un comentario explicativo.`);
+    if (FormReporte.resultado === 'NO_APLICA' && !comentario) {
+      alert('Para reportar No aplica es obligatorio ingresar un comentario explicativo.');
       return;
     }
 
@@ -2983,7 +3119,10 @@ function enlazarEventosModalReportar() {
     const btnCerrar = document.getElementById('btn-cerrar-modal-rep');
     if (btnSubmit) {
       btnSubmit.disabled = true;
-      btnSubmit.innerHTML = '<span class="spinner"></span> Guardando...';
+      const textoGuardando = FormReporte.archivoEvidencia
+        ? '<span class="spinner"></span> Guardando y subiendo evidencia a Drive...'
+        : '<span class="spinner"></span> Guardando resultado...';
+      btnSubmit.innerHTML = textoGuardando;
     }
     if (btnCancelar) btnCancelar.disabled = true;
     if (btnCerrar) btnCerrar.disabled = true;
@@ -2998,9 +3137,10 @@ function enlazarEventosModalReportar() {
         objeto: prueba._codigo,
         resultado: FormReporte.resultado,
         paso: pasoFalla ? Number(pasoFalla) : null,
-        comentario: comentario,
+        comentario: FormReporte.resultado === 'NOK' ? (FormReporte.incidencia.titulo || '') : comentario,
         documentos: docsValidos,
         incidencia: FormReporte.resultado === 'NOK' ? FormReporte.incidencia : null,
+        archivoEvidencia: (FormReporte.resultado === 'OK' || FormReporte.resultado === 'NOK') ? FormReporte.archivoEvidencia : null,
         moduloPrueba: prueba.modulo || null,
         areasPrueba: prueba.areas || []
       };
@@ -3011,6 +3151,7 @@ function enlazarEventosModalReportar() {
       AppState.modalReporteAbierto = false;
       FormReporte.documentos = [];
       FormReporte.comentario = '';
+      FormReporte.archivoEvidencia = null;
       FormReporte.resultado = 'OK';
       FormReporte.pasoFalla = '';
       FormReporte.incidencia = {
@@ -3036,8 +3177,9 @@ function enlazarEventosModalReportar() {
       const alcanceFinal = (resp && resp.resultado && resp.resultado.alcance) ? resp.resultado.alcance : (esApoyoReporte ? 'APOYO' : 'ASIGNADA');
       const tsActual = (resp && resp.resultado && resp.resultado.ts) ? resp.resultado.ts : new Date().toISOString().replace('T', ' ').substring(0, 19);
 
+      const idAsignado = (resp && resp.id) ? resp.id : (resp && resp.resultado && resp.resultado.id ? resp.resultado.id : payload.id);
       const nuevoResultado = (resp && resp.resultado) ? resp.resultado : {
-        id: payload.id,
+        id: idAsignado,
         ts: tsActual,
         tipo: payload.tipo,
         objeto: payload.objeto,
@@ -3050,7 +3192,8 @@ function enlazarEventosModalReportar() {
         ciclo: (AppState.sesion && AppState.sesion.config) ? AppState.sesion.config.ciclo_activo : 1,
         golive: (AppState.sesion && AppState.sesion.config) ? AppState.sesion.config.golive_activo : 'GL1',
         ambiente: (AppState.sesion && AppState.sesion.config) ? AppState.sesion.config.ambiente : 'QAS-200',
-        incidencia: (resp && resp.incidencia) ? (typeof resp.incidencia === 'object' ? resp.incidencia.id : resp.incidencia) : ''
+        incidencia: (resp && resp.incidencia) ? (typeof resp.incidencia === 'object' ? resp.incidencia.id : resp.incidencia) : '',
+        evidencia: (resp && resp.resultado && resp.resultado.evidencia) ? resp.resultado.evidencia : ''
       };
 
       AppState.resultadosVigentes.set(payload.objeto, nuevoResultado);
@@ -3294,7 +3437,6 @@ function renderizarModalEditarReporte() {
               <select id="editar-rep-resultado" class="form-select">
                 <option value="OK" ${h.resultado === 'OK' ? 'selected' : ''}>OK — Exitosa</option>
                 <option value="NOK" ${h.resultado === 'NOK' ? 'selected' : ''}>NOK — Con falla</option>
-                <option value="BLOQUEADO" ${h.resultado === 'BLOQUEADO' ? 'selected' : ''}>BLOQUEADO — Prerequisito no disponible</option>
                 <option value="NO_APLICA" ${h.resultado === 'NO_APLICA' ? 'selected' : ''}>NO_APLICA — Fuera de alcance</option>
               </select>
             </div>
@@ -3856,6 +3998,13 @@ function renderizarPantallaIncidencias() {
                 <td>
                   <div style="font-weight: 700;">${inc.titulo}</div>
                   <div style="font-size: 11px; color: #475569; margin-top: 2px;">${inc.detalle}</div>
+                  ${inc.evidencia ? `
+                    <div style="margin-top: 5px;">
+                      <a href="${inc.evidencia}" target="_blank" rel="noopener noreferrer" class="btn-link-evidencia" title="Abrir documento Word en Google Drive">
+                        📄 Evidencia Word (${inc.id})
+                      </a>
+                    </div>
+                  ` : ''}
                   ${inc.resolucion ? `<div style="font-size: 11px; color: #15803d; margin-top: 4px; background: #f0fdf4; padding: 3px 6px; border-radius: 3px; border: 1px solid #bbf7d0;"><strong>Resolución:</strong> ${inc.resolucion}</div>` : ''}
                 </td>
                 <td>
@@ -3991,6 +4140,14 @@ function renderizarModalGestionIncidencia() {
           <div style="font-size: 11px; color: var(--texto-secundario); margin-top: 6px;">
             Reportado por: <strong>${inc.reporta}</strong> ${inc.ts_alta ? `el ${inc.ts_alta}` : ''}
           </div>
+          ${inc.evidencia ? `
+            <div style="margin-top: 8px; padding-top: 6px; border-top: 1px dashed var(--borde-suave); display: flex; align-items: center; gap: 8px;">
+              <span style="font-size: 11px; color: var(--texto-secundario); font-weight: 600;">Evidencia Word adjunta:</span>
+              <a href="${inc.evidencia}" target="_blank" rel="noopener noreferrer" class="btn-link-evidencia">
+                📄 Abrir documento en Google Drive
+              </a>
+            </div>
+          ` : ''}
         </div>
 
         <form id="form-gestion-incidencia">
@@ -5267,7 +5424,6 @@ function renderizarPantallaCertificado() {
               <option value="todos" ${f.filtroResultado === 'todos' ? 'selected' : ''}>Todos los resultados</option>
               <option value="OK" ${f.filtroResultado === 'OK' ? 'selected' : ''}>Solo Conformes (OK)</option>
               <option value="NOK" ${f.filtroResultado === 'NOK' ? 'selected' : ''}>Solo No Conformes (NOK)</option>
-              <option value="BLOQUEADO" ${f.filtroResultado === 'BLOQUEADO' ? 'selected' : ''}>Solo Bloqueados</option>
             </select>
           </div>
 

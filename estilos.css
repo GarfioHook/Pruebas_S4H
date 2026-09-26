@@ -313,9 +313,10 @@ button {
   font-size: 14px;
   width: 100%;
   min-height: 44px;
+  transition: all 0.2s ease;
 }
 
-.btn-primario:hover {
+.btn-primario:hover:not(:disabled) {
   background-color: #0f2458;
 }
 
@@ -327,9 +328,34 @@ button {
   padding: 8px 12px;
   font-weight: 600;
   min-height: 38px;
+  transition: all 0.2s ease;
 }
-.btn-secundario:hover {
+.btn-secundario:hover:not(:disabled) {
   background-color: #f3f4f6;
+}
+
+/* Estados deshabilitados para botones y controles interactivos */
+button:disabled,
+.btn-primario:disabled,
+.btn-secundario:disabled,
+.btn-resultado:disabled {
+  opacity: 0.55 !important;
+  cursor: not-allowed !important;
+  pointer-events: none !important;
+  box-shadow: none !important;
+  filter: grayscale(20%);
+}
+
+.btn-primario:disabled {
+  background-color: #475569 !important;
+  color: #e2e8f0 !important;
+  border: 1px solid #334155 !important;
+}
+
+.btn-secundario:disabled {
+  background-color: #f1f5f9 !important;
+  color: #94a3b8 !important;
+  border-color: #cbd5e1 !important;
 }
 
 .simulador-acceso-rapido {
@@ -1673,5 +1699,66 @@ button {
   .cert-firmas {
     page-break-inside: avoid !important;
   }
+}
+
+/* ==========================================================================
+   EVIDENCIA DOCUMENTAL WORD (Google Drive)
+   ========================================================================== */
+.seccion-evidencia-word {
+  margin-top: 14px;
+  background: #f8fafc;
+  border: 1px solid var(--borde-suave);
+  border-radius: 6px;
+  padding: 12px;
+}
+
+.zona-subida-drop {
+  border: 2px dashed #94a3b8;
+  border-radius: 6px;
+  padding: 14px;
+  text-align: center;
+  background: #ffffff;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+.zona-subida-drop:hover {
+  border-color: var(--primario, #1e40af);
+  background: #eff6ff;
+}
+
+.archivo-cargado-badge {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: #ffffff;
+  border: 1px solid #bfdbfe;
+  border-radius: 6px;
+  padding: 8px 12px;
+}
+
+.btn-link-evidencia {
+  color: #1e40af;
+  font-size: 11px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  text-decoration: none;
+  background: #eff6ff;
+  border: 1px solid #bfdbfe;
+  padding: 2px 8px;
+  border-radius: 4px;
+  transition: all 0.15s ease;
+}
+
+.btn-link-evidencia:hover {
+  background: #dbeafe;
+  color: #1d4ed8;
+  text-decoration: none;
 }
 
