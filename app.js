@@ -1221,7 +1221,9 @@ async function api(accion, datos) {
   const res = await fetch(ENDPOINT, {
     method: 'POST',
     headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-    body: JSON.stringify({ accion, token, datos })
+    body: JSON.stringify({ accion, token, datos }),
+    redirect: 'follow',
+    credentials: 'omit'
   });
   const texto = await res.text();
   let json;
@@ -1229,6 +1231,17 @@ async function api(accion, datos) {
     json = JSON.parse(texto);
   } catch (err) {
     console.error('Error parseando respuesta JSON (' + res.status + '):', texto.substring(0, 300));
+    if (texto.includes('<!DOCTYPE') || texto.includes('ppConfig') || res.status === 404 || res.status === 403) {
+      throw new Error(
+        'Google Apps Script rechazó la conexión (Código ' + res.status + ').\n\n' +
+        'Causas habituales:\n' +
+        '1. Conflicto de cuentas Google activas en este navegador (típico error al tener sesión personal y corporativa abiertas).\n' +
+        '2. Bloqueo de cookies o prevención de seguimiento en Microsoft Edge.\n\n' +
+        'Solución recomendada:\n' +
+        '• Abre el portal en una VENTANA DE INCÓGNITO / INPRIVATE (Ctrl+Mayús+N), o\n' +
+        '• Cierra las otras sesiones de Google en este perfil.'
+      );
+    }
     throw new Error('El servidor Apps Script devolvió un error (código ' + res.status + ').');
   }
   if (!json.ok) {
