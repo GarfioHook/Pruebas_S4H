@@ -1200,7 +1200,10 @@ const AppState = {
     severidad: 'todos',
     reporta: 'todos',
     asignada: 'todos'
-  }
+  },
+  sincronizando: false,
+  ultimaSincronizacion: null,
+  errorSincronizacion: null
 };
 
 function esLiderOAdmin() {
@@ -1282,12 +1285,20 @@ async function inicializarApp() {
     window.addEventListener('hashchange', procesarHashRuta);
 
     if (AppState.sesion) {
-      await sincronizarEstadoServidor();
+      // 1. Carga ultra-rápida desde caché local persistente (< 5ms)
+      cargarEstadoDesdeCacheLocal();
+
+      // 2. Renderizar la interfaz INMEDIATAMENTE sin esperar la red
       if (!window.location.hash || window.location.hash === '#acceso') {
         window.location.hash = '#pruebas';
       } else {
         procesarHashRuta();
       }
+
+      // 3. Sincronizar en segundo plano sin bloquear al usuario
+      sincronizarEstadoServidor({ silencioso: true }).then(() => {
+        renderizarApp();
+      }).catch(() => {});
     } else {
       AppState.vista = 'acceso';
       renderizarApp();
@@ -1369,12 +1380,60 @@ function normalizarIncidencia(inc) {
   return inc;
 }
 
-async function sincronizarEstadoServidor() {
+function aplicarDatosEstado(data) {
+  if (!data) return false;
+  const resultados = Array.isArray(data.resultados) ? data.resultados : [];
+  
+  AppState.resultadosVigentes.clear();
+  AppState.historialPorObjeto.clear();
+
+  resultados.forEach(r => {
+    if (!AppState.historialPorObjeto.has(r.objeto)) {
+      AppState.historialPorObjeto.set(r.objeto, []);
+    }
+    AppState.historialPorObjeto.get(r.objeto).push(r);
+    AppState.resultadosVigentes.set(r.objeto, r);
+  });
+
+  if (Array.isArray(data.incidencias)) {
+    AppState.incidencias = data.incidencias.map(normalizarIncidencia).filter(Boolean);
+  }
+
+  if (Array.isArray(data.documentos)) {
+    AppState.documentosPorObjeto.clear();
+    data.documentos.forEach(d => {
+      if (!AppState.documentosPorObjeto.has(d.objeto)) {
+        AppState.documentosPorObjeto.set(d.objeto, []);
+      }
+      AppState.documentosPorObjeto.get(d.objeto).push(d);
+    });
+  }
+
+  // Guardar copia local en navegador para permitir carga instantánea futura (0 segundos de espera)
   try {
-    const data = await api('estado', {});
-    if (!data) return;
-    const resultados = Array.isArray(data.resultados) ? data.resultados : [];
+    localStorage.setItem('portland_sap_cache_estado', JSON.stringify({
+      resultados: data.resultados || [],
+      incidencias: data.incidencias || [],
+      documentos: data.documentos || [],
+      ts: Date.now()
+    }));
+  } catch (err) {
+    console.warn('No se pudo guardar estado en cache local:', err);
+  }
+
+  AppState.ultimaSincronizacion = Date.now();
+  AppState.errorSincronizacion = null;
+  return true;
+}
+
+function cargarEstadoDesdeCacheLocal() {
+  try {
+    const raw = localStorage.getItem('portland_sap_cache_estado');
+    if (!raw) return false;
+    const cache = JSON.parse(raw);
+    if (!cache || !Array.isArray(cache.resultados)) return false;
     
+    const resultados = cache.resultados || [];
     AppState.resultadosVigentes.clear();
     AppState.historialPorObjeto.clear();
 
@@ -1386,47 +1445,92 @@ async function sincronizarEstadoServidor() {
       AppState.resultadosVigentes.set(r.objeto, r);
     });
 
-    if (data.incidencias && data.documentos) {
-      // Estado consolidado recibido en una sola llamada de alta velocidad
-      AppState.incidencias = data.incidencias.map(normalizarIncidencia).filter(Boolean);
+    if (Array.isArray(cache.incidencias)) {
+      AppState.incidencias = cache.incidencias.map(normalizarIncidencia).filter(Boolean);
+    }
+
+    if (Array.isArray(cache.documentos)) {
       AppState.documentosPorObjeto.clear();
-      data.documentos.forEach(d => {
+      cache.documentos.forEach(d => {
         if (!AppState.documentosPorObjeto.has(d.objeto)) {
           AppState.documentosPorObjeto.set(d.objeto, []);
         }
         AppState.documentosPorObjeto.get(d.objeto).push(d);
       });
-    } else {
-      // Compatibilidad con versión anterior: ejecutar de forma secuencial e independiente
-      // para evitar colisiones 404 por concurrencia en Google Apps Script
-      try {
-        const dataInc = await api('incidencias', {});
-        if (dataInc && Array.isArray(dataInc.incidencias)) {
-          AppState.incidencias = dataInc.incidencias.map(normalizarIncidencia).filter(Boolean);
-        }
-      } catch (errInc) {
-        console.warn('Advertencia al sincronizar incidencias:', errInc);
-      }
-
-      try {
-        const dataDocs = await api('documentos', {});
-        if (dataDocs && Array.isArray(dataDocs.documentos)) {
-          AppState.documentosPorObjeto.clear();
-          dataDocs.documentos.forEach(d => {
-            if (!AppState.documentosPorObjeto.has(d.objeto)) {
-              AppState.documentosPorObjeto.set(d.objeto, []);
-            }
-            AppState.documentosPorObjeto.get(d.objeto).push(d);
-          });
-        }
-      } catch (errDocs) {
-        console.warn('Advertencia al sincronizar documentos:', errDocs);
-      }
     }
+
+    AppState.ultimaSincronizacion = cache.ts || null;
+    return true;
   } catch (e) {
-    console.error('Error al sincronizar estado:', e);
-    mostrarToast('Aviso: no se pudo sincronizar con el servidor.');
+    return false;
   }
+}
+
+function actualizarIndicadorSincronizacion() {
+  const el = document.getElementById('indicador-sync');
+  if (!el) return;
+  if (AppState.sincronizando) {
+    el.innerHTML = `
+      <span style="color: #2563eb; display: inline-flex; align-items: center; gap: 4px; font-weight: 500;">
+        <span class="anim-girar" style="display:inline-block;">🔄</span> Sincronizando...
+      </span>
+    `;
+  } else if (AppState.errorSincronizacion) {
+    el.innerHTML = `
+      <span style="color: #dc2626; display: inline-flex; align-items: center; gap: 4px;" title="${AppState.errorSincronizacion}">
+        <span>⚠️</span> Sin conexión
+      </span>
+    `;
+  } else if (AppState.ultimaSincronizacion) {
+    el.innerHTML = `
+      <span style="color: #059669; display: inline-flex; align-items: center; gap: 4px;" title="Datos sincronizados con Google Sheets">
+        <span>●</span> En línea
+      </span>
+    `;
+  } else {
+    el.innerHTML = `<span style="color: #64748b;">● Conectando...</span>`;
+  }
+}
+
+let _promesaSincronizacion = null;
+
+async function sincronizarEstadoServidor(opciones = {}) {
+  const { forzar = false, silencioso = false } = opciones;
+
+  // Deduplicación: reusar petición en vuelo si ya se está sincronizando
+  if (_promesaSincronizacion) {
+    return _promesaSincronizacion;
+  }
+
+  // Cooldown de 10 segundos: si se sincronizó recientemente y no es forzado, no saturar la red
+  const ahora = Date.now();
+  if (!forzar && AppState.ultimaSincronizacion && (ahora - AppState.ultimaSincronizacion < 10000)) {
+    return;
+  }
+
+  AppState.sincronizando = true;
+  actualizarIndicadorSincronizacion();
+
+  _promesaSincronizacion = (async () => {
+    try {
+      const data = await api('estado', {});
+      if (data) {
+        aplicarDatosEstado(data);
+      }
+    } catch (e) {
+      console.error('Error al sincronizar estado:', e);
+      AppState.errorSincronizacion = e.message || 'Error de conexión';
+      if (!silencioso) {
+        mostrarToast('Aviso: no se pudo sincronizar con el servidor.');
+      }
+    } finally {
+      AppState.sincronizando = false;
+      _promesaSincronizacion = null;
+      actualizarIndicadorSincronizacion();
+    }
+  })();
+
+  return _promesaSincronizacion;
 }
 
 function procesarHashRuta() {
@@ -1511,14 +1615,27 @@ async function iniciarSesion(email) {
     };
     localStorage.setItem('portland_sap_sesion', JSON.stringify(AppState.sesion));
 
+    // Si el backend ya devolvió el estado consolidado en login, aplicarlo de inmediato
+    if (datos.estado) {
+      aplicarDatosEstado(datos.estado);
+    } else {
+      cargarEstadoDesdeCacheLocal();
+    }
+
+    // Desactivar spinner y entrar de INMEDIATO (2 segundos en vez de 30 segundos)
+    AppState.cargando = false;
     AppState.subvistaPruebas = 'mis';
-    await sincronizarEstadoServidor();
     window.location.hash = '#pruebas';
+    renderizarApp();
+
+    // Sincronizar en segundo plano de forma silenciosa
+    sincronizarEstadoServidor({ silencioso: true }).then(() => {
+      renderizarApp();
+    }).catch(() => {});
   } catch (err) {
-    alert(err.message);
-  } finally {
     AppState.cargando = false;
     renderizarApp();
+    alert(err.message);
   }
 }
 
@@ -1615,6 +1732,25 @@ function renderizarBarraSuperior() {
       </nav>
 
       <div class="usuario-cabecera">
+        <!-- Indicador de sincronización en segundo plano -->
+        <div id="indicador-sync" style="font-size: 11px; display: flex; align-items: center; gap: 4px; padding: 4px 8px; border-radius: 4px; background: rgba(0,0,0,0.03);">
+          ${AppState.sincronizando ? `
+            <span style="color: #2563eb; display: inline-flex; align-items: center; gap: 4px; font-weight: 500;">
+              <span class="anim-girar" style="display:inline-block;">🔄</span> Sincronizando...
+            </span>
+          ` : AppState.errorSincronizacion ? `
+            <span style="color: #dc2626; display: inline-flex; align-items: center; gap: 4px;" title="${AppState.errorSincronizacion}">
+              <span>⚠️</span> Sin conexión
+            </span>
+          ` : AppState.ultimaSincronizacion ? `
+            <span style="color: #059669; display: inline-flex; align-items: center; gap: 4px;" title="Datos sincronizados con Google Sheets">
+              <span>●</span> En línea
+            </span>
+          ` : `
+            <span style="color: #64748b;">● Conectando...</span>
+          `}
+        </div>
+
         <div class="usuario-info">
           <div class="usuario-nombre">${p.nombre}</div>
           <div class="usuario-rol">${p.rol} · ${p.sociedad || 'Portland'}</div>

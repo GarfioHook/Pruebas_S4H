@@ -1762,3 +1762,13 @@ button:disabled,
   text-decoration: none;
 }
 
+@keyframes girarAnim {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.anim-girar {
+  animation: girarAnim 1s linear infinite;
+  display: inline-block;
+}
+
