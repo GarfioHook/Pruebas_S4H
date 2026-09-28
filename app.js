@@ -1461,9 +1461,15 @@ function procesarHashRuta() {
     }
   } else if (hash === '#avance') {
     AppState.vista = 'avance';
+    sincronizarEstadoServidor().then(() => {
+      if (AppState.vista === 'avance') renderizarApp();
+    }).catch(err => console.error(err));
   } else if (hash === '#gestion') {
     if (esLiderOAdmin()) {
       AppState.vista = 'gestion';
+      sincronizarEstadoServidor().then(() => {
+        if (AppState.vista === 'gestion') renderizarApp();
+      }).catch(err => console.error(err));
     } else {
       AppState.vista = 'pruebas';
     }
@@ -4778,11 +4784,28 @@ function renderizarPantallaGestion() {
               Seguimiento ejecutivo por modulo, area y avance individual de ejecutores · Exclusivo Gabriel Salinas
             </div>
           </div>
-          <div style="font-size: 12px; background: #e0e7ff; color: #1e3a8a; padding: 4px 10px; border-radius: 4px; font-weight: 700;">
-            LIDER DE IMPLEMENTACION
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <button class="btn-secundario" id="btn-refrescar-gestion" style="display: inline-flex; align-items: center; gap: 6px; font-size: 12px; padding: 6px 12px; font-weight: 600;">
+              <span>🔄</span> Actualizar datos
+            </button>
+            <div style="font-size: 12px; background: #e0e7ff; color: #1e3a8a; padding: 6px 10px; border-radius: 4px; font-weight: 700;">
+              LIDER DE IMPLEMENTACION
+            </div>
           </div>
         </div>
       </div>
+
+      <!-- Aviso orientativo si no hay reportes cargados en memoria -->
+      ${todosLosReportes.length === 0 ? `
+        <div style="background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 8px; padding: 12px 16px; margin-bottom: 16px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+          <div style="font-size: 13px; color: #1e40af;">
+            ℹ️ <strong>0 reportes en memoria local.</strong> Si tu equipo ya registró pruebas en Google Sheets, pulsa <strong>"Actualizar datos"</strong> para sincronizar con la planilla.
+          </div>
+          <button class="btn-primario" id="btn-sincronizar-vacio-gestion" style="font-size: 12px; padding: 6px 14px;">
+            🔄 Sincronizar con Google Sheets
+          </button>
+        </div>
+      ` : ''}
 
       <!-- KPIs de participacion y volumen -->
       <div class="cuadricula-kpis">
@@ -5137,6 +5160,38 @@ function enlazarEventosVistaGestion() {
       document.getElementById('seccion-usuarios-gestion')?.scrollIntoView({ behavior: 'smooth' });
     });
   });
+
+  // Botón de sincronización / actualización de datos
+  const refrescar = async (btn) => {
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = '⏳ Sincronizando...';
+    }
+    mostrarToast('Sincronizando con Google Sheets...');
+    try {
+      await sincronizarEstadoServidor();
+      renderizarApp();
+      const cant = AppState.resultadosVigentes.size;
+      mostrarToast(`Sincronización completada: ${cant} pruebas registradas.`);
+    } catch (err) {
+      mostrarToast('Error al sincronizar: ' + err.message);
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.innerHTML = '<span>🔄</span> Actualizar datos';
+      }
+    }
+  };
+
+  const btnRefrescar = document.getElementById('btn-refrescar-gestion');
+  if (btnRefrescar) {
+    btnRefrescar.addEventListener('click', () => refrescar(btnRefrescar));
+  }
+
+  const btnSincVacio = document.getElementById('btn-sincronizar-vacio-gestion');
+  if (btnSincVacio) {
+    btnSincVacio.addEventListener('click', () => refrescar(btnSincVacio));
+  }
 }
 
 /* ==========================================================================
