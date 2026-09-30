@@ -1157,6 +1157,9 @@ const AppState = {
   sesion: null,
   vista: 'acceso', // 'acceso' | 'pruebas' | 'ficha' | 'incidencias' | 'avance' | 'buscar'
   subvistaPruebas: 'mis', // 'mis' | 'todas'
+  errorAcceso: null,
+  tipoErrorAcceso: null, // 'google_404' | 'general'
+  ultimoEmailAcceso: '',
   filtros: {
     tipo: 'todos',
     estado: 'todos',
@@ -1601,10 +1604,15 @@ function procesarHashRuta() {
    GESTION DE SESION
    ========================================================================== */
 async function iniciarSesion(email) {
+  const emailLimpio = String(email || '').trim().toLowerCase();
+  AppState.ultimoEmailAcceso = emailLimpio;
+  AppState.errorAcceso = null;
+  AppState.tipoErrorAcceso = null;
+  AppState.cargando = true;
+  renderizarApp();
+
   try {
-    AppState.cargando = true;
-    renderizarApp();
-    const datos = await api('login', { email });
+    const datos = await api('login', { email: emailLimpio });
     
     const expira = Date.now() + (12 * 60 * 60 * 1000); // 12 horas
     AppState.sesion = {
@@ -1624,6 +1632,8 @@ async function iniciarSesion(email) {
 
     // Desactivar spinner y entrar de INMEDIATO (2 segundos en vez de 30 segundos)
     AppState.cargando = false;
+    AppState.errorAcceso = null;
+    AppState.tipoErrorAcceso = null;
     AppState.subvistaPruebas = 'mis';
     window.location.hash = '#pruebas';
     renderizarApp();
@@ -1634,13 +1644,17 @@ async function iniciarSesion(email) {
     }).catch(() => {});
   } catch (err) {
     AppState.cargando = false;
+    const msg = (err && err.message) ? err.message : String(err);
+    AppState.errorAcceso = msg;
+    AppState.tipoErrorAcceso = (msg.includes('Google Apps Script') || msg.includes('404') || msg.includes('ppConfig')) ? 'google_404' : 'general';
     renderizarApp();
-    alert(err.message);
   }
 }
 
 function cerrarSesion() {
   AppState.sesion = null;
+  AppState.errorAcceso = null;
+  AppState.tipoErrorAcceso = null;
   localStorage.removeItem('portland_sap_sesion');
   window.location.hash = '#acceso';
   AppState.vista = 'acceso';
@@ -1785,41 +1799,66 @@ function mostrarToast(mensaje) {
    PANTALLA 1: ACCESO (§8.1)
    ========================================================================== */
 function renderizarPantallaAcceso() {
+  const errorHtml = AppState.errorAcceso ? `
+    <div class="alerta-acceso-error" role="alert">
+      <div class="alerta-titulo">
+        <span>⚠️</span>
+        <span>${AppState.tipoErrorAcceso === 'google_404' ? 'Conflicto de cuentas Google (Error 404)' : 'No se pudo iniciar sesión'}</span>
+      </div>
+      <div class="alerta-cuerpo">
+        ${AppState.tipoErrorAcceso === 'google_404' ? `
+          Google Apps Script no procesó la conexión porque detectó múltiples cuentas de Google (personal y corporativa) abiertas simultáneamente en este navegador.
+        ` : AppState.errorAcceso}
+      </div>
+      ${AppState.tipoErrorAcceso === 'google_404' ? `
+        <div class="alerta-solucion">
+          <strong>💡 Solución inmediata para ingresar:</strong>
+          <ol style="margin-left: 18px; margin-top: 6px; line-height: 1.5;">
+            <li>Abre esta misma página en una <strong>Ventana de Incógnito / InPrivate</strong> (<kbd>Ctrl</kbd> + <kbd>Mayús</kbd> + <kbd>N</kbd>).</li>
+            <li>O ingresa desde un perfil limpio del navegador sin sesiones personales de Google activas.</li>
+          </ol>
+        </div>
+      ` : ''}
+    </div>
+  ` : '';
+
   return `
     <div class="contenedor-acceso">
       <div class="tarjeta-acceso">
         <div class="acceso-encabezado">
           <div class="acceso-titulo">Portal de Pruebas SAP S/4HANA</div>
-          <div class="acceso-desc">Certificacion Grupo Portland · Plan de pruebas v8.0</div>
+          <div class="acceso-desc">Certificación Grupo Portland · Plan de pruebas v8.0</div>
         </div>
+
+        ${errorHtml}
 
         <form id="form-acceso" onsubmit="event.preventDefault();">
           <div class="form-grupo">
             <label for="email-acceso">Correo corporativo</label>
-            <input type="email" id="email-acceso" class="form-input" placeholder="ejemplo@pjportland.com" required autofocus>
+            <input type="email" id="email-acceso" class="form-input" placeholder="ejemplo@pjportland.com" value="${AppState.ultimoEmailAcceso || ''}" required autofocus>
           </div>
-          <button type="submit" id="btn-ingresar" class="btn-primario">
+          <button type="submit" id="btn-ingresar" class="btn-primario" ${AppState.cargando ? 'disabled' : ''}>
             ${AppState.cargando ? '<span class="spinner"></span> Ingresando...' : 'Entrar al portal'}
           </button>
         </form>
 
         <div style="margin-top: 14px; font-size: 12px; color: var(--texto-secundario);">
-          La sesion permanece activa durante 12 horas en este navegador. Si su correo no esta en la lista, solicite el alta al lider de implementacion.
+          La sesión permanece activa durante 12 horas en este navegador. Si su correo no está en la lista, solicite el alta al líder de implementación.
         </div>
 
         ${SIMULADO ? `
           <div class="simulador-acceso-rapido">
-            <div class="simulador-titulo">Selector rapido de perfiles (Modo simulado)</div>
+            <div class="simulador-titulo">Selector rápido de perfiles (Modo simulado)</div>
             <select id="select-usuario-rapido" class="form-select" style="font-size: 12px;">
               <option value="">-- Seleccione un usuario real --</option>
               <option value="arestrepo@pjportland.com">ANGELA RESTREPO (Key-User Comercial / Aprobador · CO11)</option>
-              <option value="fpacheco@pjportland.com">FELIPE PACHECO (Key-User Facturacion · CL11)</option>
+              <option value="fpacheco@pjportland.com">FELIPE PACHECO (Key-User Facturación · CL11)</option>
               <option value="csalas@pjportland.com">CRISTIAN SALAS (Key-User Operaciones · CL11)</option>
-              <option value="gsalinas@pjportland.cl">GABRIEL SALINAS (LIDER · gsalinas@pjportland.cl)</option>
-              <option value="ljara@pjportland.cl">LEANDRO JARA (TI · Modulo MM)</option>
-              <option value="hcorrea@pjportland.cl">HECTOR CORREA (TI · Modulo SD)</option>
-              <option value="osella@pjportland.cl">OSCAR SELLA (TI · Modulo FICO)</option>
-              <option value="dcorrea@pjportland.cl">DANIELA CORREA (TI / Contabilidad · Modulo FICO)</option>
+              <option value="gsalinas@pjportland.cl">GABRIEL SALINAS (LÍDER · gsalinas@pjportland.cl)</option>
+              <option value="ljara@pjportland.cl">LEANDRO JARA (TI · Módulo MM)</option>
+              <option value="hcorrea@pjportland.cl">HECTOR CORREA (TI · Módulo SD)</option>
+              <option value="osella@pjportland.cl">OSCAR SELLA (TI · Módulo FICO)</option>
+              <option value="dcorrea@pjportland.cl">DANIELA CORREA (TI / Contabilidad · Módulo FICO)</option>
             </select>
           </div>
         ` : ''}
@@ -1833,9 +1872,20 @@ function enlazarEventosAcceso() {
   const inputEmail = document.getElementById('email-acceso');
   const selectRapido = document.getElementById('select-usuario-rapido');
 
+  if (inputEmail) {
+    inputEmail.addEventListener('input', (e) => {
+      AppState.ultimoEmailAcceso = e.target.value;
+      if (AppState.errorAcceso) {
+        AppState.errorAcceso = null;
+        AppState.tipoErrorAcceso = null;
+      }
+    });
+  }
+
   if (form) {
     form.addEventListener('submit', () => {
-      const email = inputEmail.value.trim();
+      if (AppState.cargando) return;
+      const email = inputEmail ? inputEmail.value.trim() : '';
       if (email) iniciarSesion(email);
     });
   }
@@ -1843,7 +1893,8 @@ function enlazarEventosAcceso() {
   if (selectRapido) {
     selectRapido.addEventListener('change', (e) => {
       if (e.target.value) {
-        inputEmail.value = e.target.value;
+        if (inputEmail) inputEmail.value = e.target.value;
+        AppState.ultimoEmailAcceso = e.target.value;
         iniciarSesion(e.target.value);
       }
     });
