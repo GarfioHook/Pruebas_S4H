@@ -723,6 +723,18 @@ const LISTA_USUARIOS_SIMULADOS = [
     "cargo": "MODULO FICO",
     "departamento origen": "CONTABILIDAD",
     "departamento": "CONTABILIDAD"
+  },
+  {
+    "email": "acuba@pjportland.com",
+    "nombre": "ALONSO CUBA",
+    "rol": "EQUIPO_PROYECTO",
+    "areas": "",
+    "modulos": "MM, SD, FICO, EWM, CFG",
+    "sociedad": "CL11",
+    "estado": "ACTIVO",
+    "cargo": "MODULO MM",
+    "departamento origen": "TI",
+    "departamento": "TI"
   }
 ];
 
@@ -828,7 +840,8 @@ const MockApi = (function() {
 
       if (accion === 'login') {
         const email = String(datos.email || '').trim().toLowerCase();
-        const usuario = LISTA_USUARIOS_SIMULADOS.find(u => u.email.toLowerCase() === email);
+        const listaU = typeof obtenerListaUsuarios === 'function' ? obtenerListaUsuarios() : LISTA_USUARIOS_SIMULADOS;
+        const usuario = listaU.find(u => (u.email || '').toLowerCase() === email);
         if (!usuario) {
           throw new Error('El correo ingresado no figura en la lista de usuarios habilitados. Solicite su alta al lider de implementacion (Gabriel Salinas).');
         }
@@ -1206,14 +1219,102 @@ const AppState = {
   },
   sincronizando: false,
   ultimaSincronizacion: null,
-  errorSincronizacion: null
+  errorSincronizacion: null,
+  usuarios: []
 };
 
 function esLiderOAdmin() {
   if (!AppState.sesion || !AppState.sesion.perfil) return false;
   const p = AppState.sesion.perfil;
-  const email = (p.email || '').toLowerCase();
-  return p.rol === 'LIDER' || email === 'gsalinas@pjportland.cl' || email === 'gsalinas@pjportland.com' || email === 'garfiohook@gmail.com';
+  const rol = String(p.rol || '').trim().toUpperCase();
+  const email = String(p.email || '').trim().toLowerCase();
+  const liderEmails = ['gsalinas@pjportland.cl', 'gsalinas@pjportland.com', 'garfiohook@gmail.com'];
+  if (rol === 'LIDER' || rol === 'ADMIN' || liderEmails.includes(email)) return true;
+  if (Array.isArray(AppState.usuarios) && AppState.usuarios.length > 0) {
+    const uMatch = AppState.usuarios.find(u => String(u.email || '').trim().toLowerCase() === email);
+    if (uMatch) {
+      const r = String(uMatch.rol || '').trim().toUpperCase();
+      if (r === 'LIDER' || r === 'ADMIN') return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Obtiene la lista unificada y actualizada de usuarios.
+ * Prioriza los usuarios sincronizados en vivo desde Google Sheets (AppState.usuarios),
+ * con respaldo en LISTA_USUARIOS_SIMULADOS y deduplicación inteligente.
+ */
+function obtenerListaUsuarios() {
+  const base = (Array.isArray(AppState.usuarios) && AppState.usuarios.length > 0)
+    ? AppState.usuarios
+    : LISTA_USUARIOS_SIMULADOS;
+
+  const map = new Map();
+  base.forEach(u => {
+    const em = String(u.email || '').trim().toLowerCase();
+    if (em) {
+      map.set(em, {
+        email: em,
+        nombre: u.nombre || em,
+        rol: String(u.rol || 'KEY_USER').trim().toUpperCase(),
+        areas: u.areas || '',
+        modulos: u.modulos || '',
+        sociedad: u.sociedad || 'CL11',
+        estado: String(u.estado || 'ACTIVO').trim().toUpperCase(),
+        cargo: u.cargo || '',
+        'departamento origen': u['departamento origen'] || u.departamento || '',
+        departamento: u.departamento || u['departamento origen'] || ''
+      });
+    }
+  });
+
+  // Asegurar que LISTA_USUARIOS_SIMULADOS sirva de respaldo si falta algún usuario
+  LISTA_USUARIOS_SIMULADOS.forEach(u => {
+    const em = String(u.email || '').trim().toLowerCase();
+    if (em && !map.has(em)) {
+      map.set(em, { ...u, email: em });
+    }
+  });
+
+  // Asegurar que el usuario activo en sesión esté presente con su rol
+  if (AppState.sesion && AppState.sesion.perfil && AppState.sesion.perfil.email) {
+    const emActual = String(AppState.sesion.perfil.email).trim().toLowerCase();
+    if (map.has(emActual)) {
+      const existente = map.get(emActual);
+      if (AppState.sesion.perfil.rol) existente.rol = String(AppState.sesion.perfil.rol).toUpperCase();
+      if (AppState.sesion.perfil.nombre) existente.nombre = AppState.sesion.perfil.nombre;
+    } else {
+      map.set(emActual, { ...AppState.sesion.perfil, email: emActual });
+    }
+  }
+
+  // Si hay reportes con emails no registrados, incorporarlos automáticamente para que sus reportes no queden huérfanos
+  if (AppState.historialPorObjeto) {
+    AppState.historialPorObjeto.forEach(lista => {
+      if (Array.isArray(lista)) {
+        lista.forEach(r => {
+          const em = String(r.email || '').trim().toLowerCase();
+          if (em && !map.has(em)) {
+            map.set(em, {
+              email: em,
+              nombre: em.split('@')[0].toUpperCase(),
+              rol: 'KEY_USER',
+              areas: '',
+              modulos: '',
+              sociedad: 'CL11',
+              estado: 'ACTIVO',
+              cargo: 'Ejecutor',
+              'departamento origen': 'OPERACIONES',
+              departamento: 'OPERACIONES'
+            });
+          }
+        });
+      }
+    });
+  }
+
+  return Array.from(map.values());
 }
 
 // Cliente unificado de comunicacion con el backend
@@ -1412,12 +1513,28 @@ function aplicarDatosEstado(data) {
     });
   }
 
+  if (Array.isArray(data.usuarios) && data.usuarios.length > 0) {
+    AppState.usuarios = data.usuarios.map(u => ({
+      email: String(u.email || '').trim().toLowerCase(),
+      nombre: u.nombre || u.email || '',
+      rol: String(u.rol || 'KEY_USER').trim().toUpperCase(),
+      areas: u.areas || '',
+      modulos: u.modulos || '',
+      sociedad: u.sociedad || 'CL11',
+      estado: String(u.estado || 'ACTIVO').trim().toUpperCase(),
+      cargo: u.cargo || '',
+      'departamento origen': u['departamento origen'] || u.departamento || '',
+      departamento: u.departamento || u['departamento origen'] || ''
+    }));
+  }
+
   // Guardar copia local en navegador para permitir carga instantánea futura (0 segundos de espera)
   try {
     localStorage.setItem('portland_sap_cache_estado', JSON.stringify({
       resultados: data.resultados || [],
       incidencias: data.incidencias || [],
       documentos: data.documentos || [],
+      usuarios: AppState.usuarios || [],
       ts: Date.now()
     }));
   } catch (err) {
@@ -1460,6 +1577,10 @@ function cargarEstadoDesdeCacheLocal() {
         }
         AppState.documentosPorObjeto.get(d.objeto).push(d);
       });
+    }
+
+    if (Array.isArray(cache.usuarios) && cache.usuarios.length > 0) {
+      AppState.usuarios = cache.usuarios;
     }
 
     AppState.ultimaSincronizacion = cache.ts || null;
@@ -1855,6 +1976,7 @@ function renderizarPantallaAcceso() {
               <option value="fpacheco@pjportland.com">FELIPE PACHECO (Key-User Facturación · CL11)</option>
               <option value="csalas@pjportland.com">CRISTIAN SALAS (Key-User Operaciones · CL11)</option>
               <option value="gsalinas@pjportland.cl">GABRIEL SALINAS (LÍDER · gsalinas@pjportland.cl)</option>
+              <option value="acuba@pjportland.com">ALONSO CUBA (TI / Proyecto · acuba@pjportland.com)</option>
               <option value="ljara@pjportland.cl">LEANDRO JARA (TI · Módulo MM)</option>
               <option value="hcorrea@pjportland.cl">HECTOR CORREA (TI · Módulo SD)</option>
               <option value="osella@pjportland.cl">OSCAR SELLA (TI · Módulo FICO)</option>
@@ -1911,7 +2033,8 @@ function usuarioPerteneceAArea(email, areaKey) {
   const emailNorm = String(email).trim().toLowerCase();
   const areaNorm = String(areaKey).trim().toUpperCase();
 
-  const u = LISTA_USUARIOS_SIMULADOS.find(x => (x.email || '').toLowerCase() === emailNorm)
+  const lista = typeof obtenerListaUsuarios === 'function' ? obtenerListaUsuarios() : LISTA_USUARIOS_SIMULADOS;
+  const u = lista.find(x => (x.email || '').toLowerCase() === emailNorm)
     || (AppState.sesion && AppState.sesion.perfil && (AppState.sesion.perfil.email || '').toLowerCase() === emailNorm ? AppState.sesion.perfil : null);
 
   if (!u) return false;
@@ -1936,7 +2059,7 @@ function usuarioPerteneceAArea(email, areaKey) {
   if (areaNorm === 'FINANZAS' && (depto.includes('FINANZAS') || depto.includes('TESORERIA') || deptoOrig.includes('FINANZAS') || deptoOrig.includes('TESORERIA'))) return true;
   if (areaNorm === 'CREDITO Y COBRANZAS' && (depto.includes('CREDITO') || depto.includes('COBRANZAS') || deptoOrig.includes('CREDITO') || deptoOrig.includes('COBRANZAS'))) return true;
   if (areaNorm === 'APROBADOR' && (depto.includes('APROBADOR') || deptoOrig.includes('APROBADOR') || (u.cargo && u.cargo.toUpperCase().includes('GERENTE')))) return true;
-  if (areaNorm === 'TI' && (u.rol === 'LIDER' || u.rol === 'EQUIPO_PROYECTO' || depto.includes('TI') || deptoOrig.includes('TI'))) return true;
+  if ((areaNorm === 'TI' || areaNorm === 'PROYECTO' || areaNorm === 'EQUIPO_PROYECTO') && (u.rol === 'LIDER' || u.rol === 'EQUIPO_PROYECTO' || depto.includes('TI') || deptoOrig.includes('TI'))) return true;
 
   return false;
 }
@@ -1944,7 +2067,7 @@ function usuarioPerteneceAArea(email, areaKey) {
 /**
  * Determina si una prueba corresponde al ámbito de asignación del usuario.
  * - LIDER: acceso a todo.
- * - EQUIPO_PROYECTO: Casos Unitarios de sus módulos (o todos los CU si no tiene módulo restrictivo).
+ * - EQUIPO_PROYECTO: Casos Unitarios de sus módulos y Escenarios E2E (transversales).
  * - KEY_USER: Escenarios E2E donde sus áreas participan, o CU de sus módulos.
  */
 function esPruebaAsignadaAUsuario(item, perfil) {
@@ -1962,11 +2085,13 @@ function esPruebaAsignadaAUsuario(item, perfil) {
       }
       return true;
     }
-    if (item._tipo === 'E2E' && areasUser.length > 0) {
+    if (item._tipo === 'E2E') {
+      // El equipo de proyecto participa en todos los procesos transversales si no tiene restricción
+      if (areasUser.length === 0) return true;
       const itemAreas = (item.areas || []).map(a => String(a).toUpperCase());
       return itemAreas.some(a => areasUser.includes(a));
     }
-    return false;
+    return true;
   }
 
   // KEY_USER
@@ -4137,7 +4262,7 @@ function renderizarPantallaIncidencias() {
             <select id="filtro-inc-reporta" class="form-select">
               <option value="todos" ${f.reporta === 'todos' ? 'selected' : ''}>Todos los reportantes</option>
               ${reportantesUnicos.map(email => {
-                const u = LISTA_USUARIOS_SIMULADOS.find(x => (x.email || '').toLowerCase() === email.toLowerCase());
+                const u = obtenerListaUsuarios().find(x => (x.email || '').toLowerCase() === email.toLowerCase());
                 const etiqueta = u ? `${u.nombre} (${email})` : email;
                 return `<option value="${email}" ${f.reporta.toLowerCase() === email.toLowerCase() ? 'selected' : ''}>${etiqueta}</option>`;
               }).join('')}
@@ -4150,7 +4275,7 @@ function renderizarPantallaIncidencias() {
               <option value="todos" ${f.asignada === 'todos' ? 'selected' : ''}>Todas las asignaciones</option>
               <option value="__sin_asignar__" ${f.asignada === '__sin_asignar__' ? 'selected' : ''}>Sin asignar / Pendiente</option>
               ${asignacionesUnicas.map(asig => {
-                const u = LISTA_USUARIOS_SIMULADOS.find(x => (x.email || '').toLowerCase() === asig.toLowerCase());
+                const u = obtenerListaUsuarios().find(x => (x.email || '').toLowerCase() === asig.toLowerCase());
                 const etiqueta = u ? `${u.nombre} (${asig})` : asig;
                 return `<option value="${asig}" ${f.asignada.toLowerCase() === asig.toLowerCase() ? 'selected' : ''}>${etiqueta}</option>`;
               }).join('')}
@@ -4758,36 +4883,81 @@ function renderizarPantallaGestion() {
   });
 
   // 2. Reporte por area ejecutora y equipo TI
-  const usuariosTI = LISTA_USUARIOS_SIMULADOS.filter(u => u.rol === 'EQUIPO_PROYECTO');
+  const listaTodosUsuarios = obtenerListaUsuarios();
+  const usuariosTI = listaTodosUsuarios.filter(u => {
+    const rol = String(u.rol || '').toUpperCase();
+    const dep = String(u.departamento || u['departamento origen'] || '').toUpperCase();
+    return rol === 'EQUIPO_PROYECTO' || rol === 'LIDER' || dep.includes('TI') || dep.includes('PROYECTO');
+  });
   const emailsTI = usuariosTI.map(u => u.email.toLowerCase());
   const reportesGenTI = todosLosReportes.filter(r => emailsTI.includes(String(r.email).toLowerCase()));
-  let usersTIActivos = 0;
-  let usersTISinReportes = 0;
-  usuariosTI.forEach(u => {
-    const tiene = todosLosReportes.some(r => String(r.email).toLowerCase() === u.email.toLowerCase());
-    if (tiene) usersTIActivos++;
-    else usersTISinReportes++;
-  });
-  const cuCubiertosTI = cuList.filter(c => {
-    const r = AppState.resultadosVigentes.get(c.id);
-    return r && r.resultado !== 'PENDIENTE';
-  }).length;
 
-  const filaTI = {
-    key: 'TI',
-    nombreEtiqueta: 'TI / Equipo de Proyecto',
+  // 2.1 Línea de Escenarios E2E para Equipo de Proyecto (identificación de pruebas E2E)
+  let e2eCubiertosTI = 0;
+  e2eList.forEach(e => {
+    const hist = AppState.historialPorObjeto.get(e.codigo) || [];
+    const cubiertoPorTI = hist.some(r => r && r.resultado && r.resultado !== 'PENDIENTE' && emailsTI.includes(String(r.email).toLowerCase()));
+    if (cubiertoPorTI) {
+      e2eCubiertosTI++;
+    } else {
+      const rVig = AppState.resultadosVigentes.get(e.codigo);
+      if (rVig && rVig.resultado && rVig.resultado !== 'PENDIENTE' && emailsTI.includes(String(rVig.email).toLowerCase())) {
+        e2eCubiertosTI++;
+      }
+    }
+  });
+
+  const reportesE2ETI = reportesGenTI.filter(r => r.tipo === 'E2E' || String(r.objeto || '').startsWith('E2E-'));
+  const emailsTIConE2E = new Set(reportesE2ETI.map(r => String(r.email || '').toLowerCase()));
+  const usersTIActivosE2E = usuariosTI.filter(u => emailsTIConE2E.has(u.email.toLowerCase())).length;
+
+  const filaProyectoE2E = {
+    key: 'TI_E2E',
+    filtroAreaKey: 'TI',
+    nombreEtiqueta: 'Equipo de Proyecto (E2E)',
     color: '16337A',
     esTI: true,
-    etiquetaAmbito: '296 Casos Unitarios (5 Módulos)',
+    etiquetaAmbito: `${e2eList.length} Escenarios E2E`,
+    totalEsc: e2eList.length,
+    escCubiertos: e2eCubiertosTI,
+    pctCobertura: e2eList.length ? ((e2eCubiertosTI / e2eList.length) * 100).toFixed(1) : '0.0',
+    volGenerado: reportesE2ETI.length,
+    volAsignada: reportesE2ETI.filter(r => r.alcance === 'ASIGNADA').length,
+    volApoyo: reportesE2ETI.filter(r => r.alcance === 'APOYO').length,
+    totalUsuarios: usuariosTI.length,
+    usersActivos: usersTIActivosE2E,
+    usersSinReportes: usuariosTI.length - usersTIActivosE2E
+  };
+
+  // 2.2 Línea de Casos Unitarios para Equipo de Proyecto
+  const cuCubiertosTI = cuList.filter(c => {
+    const hist = AppState.historialPorObjeto.get(c.id) || [];
+    const cubierto = hist.some(r => r && r.resultado && r.resultado !== 'PENDIENTE' && (emailsTI.includes(String(r.email).toLowerCase()) || !r.email));
+    if (cubierto) return true;
+    const rVig = AppState.resultadosVigentes.get(c.id);
+    return rVig && rVig.resultado && rVig.resultado !== 'PENDIENTE';
+  }).length;
+
+  const reportesCUTI = reportesGenTI.filter(r => r.tipo === 'CU' || !String(r.objeto || '').startsWith('E2E-'));
+  const emailsTIConCU = new Set(reportesCUTI.map(r => String(r.email || '').toLowerCase()));
+  const usersTIActivosCU = usuariosTI.filter(u => emailsTIConCU.has(u.email.toLowerCase())).length;
+
+  const filaProyectoCU = {
+    key: 'TI_CU',
+    filtroAreaKey: 'TI',
+    nombreEtiqueta: 'Equipo de Proyecto (Casos Unitarios)',
+    color: '1e40af',
+    esTI: true,
+    etiquetaAmbito: `${cuList.length} Casos Unitarios (5 Módulos)`,
     totalEsc: cuList.length,
     escCubiertos: cuCubiertosTI,
     pctCobertura: cuList.length ? ((cuCubiertosTI / cuList.length) * 100).toFixed(1) : '0.0',
-    volGenerado: reportesGenTI.length,
-    volAsignada: reportesGenTI.filter(r => r.alcance === 'ASIGNADA').length,
-    volApoyo: reportesGenTI.filter(r => r.alcance === 'APOYO').length,
+    volGenerado: reportesCUTI.length,
+    volAsignada: reportesCUTI.filter(r => r.alcance === 'ASIGNADA').length,
+    volApoyo: reportesCUTI.filter(r => r.alcance === 'APOYO').length,
     totalUsuarios: usuariosTI.length,
-    usersActivos: usersTIActivos,
-    usersSinReportes: usersTISinReportes
+    usersActivos: usersTIActivosCU,
+    usersSinReportes: usuariosTI.length - usersTIActivosCU
   };
 
   const reporteAreas = areas.map(a => {
@@ -4810,7 +4980,7 @@ function renderizarPantallaGestion() {
     const pctCobertura = totalEsc ? ((escCubiertos / totalEsc) * 100).toFixed(1) : '0.0';
 
     // Key-Users asignados nominalmente a esta area funcional
-    const usuariosA = LISTA_USUARIOS_SIMULADOS.filter(u => {
+    const usuariosA = listaTodosUsuarios.filter(u => {
       if (u.rol !== 'KEY_USER') return false;
       return usuarioPerteneceAArea(u.email, a.key);
     });
@@ -4830,6 +5000,7 @@ function renderizarPantallaGestion() {
 
     return {
       key: a.key,
+      filtroAreaKey: a.key,
       nombreEtiqueta: a.key,
       color: a.color || 'B26B00',
       esTI: false,
@@ -4846,23 +5017,22 @@ function renderizarPantallaGestion() {
     };
   });
 
-  const tablaReporteAreas = [filaTI, ...reporteAreas];
+  const tablaReporteAreas = [filaProyectoE2E, filaProyectoCU, ...reporteAreas];
 
   // 3. Seguimiento individual de usuarios (para detectar quien no esta reportando)
   const emailsVistos = new Set();
+  const emailsIgnorados = new Set(['gsalinas@pjportland.com', 'garfiohook@gmail.com']);
   const todosUsuarios = [];
-  LISTA_USUARIOS_SIMULADOS.forEach(u => {
+  listaTodosUsuarios.forEach(u => {
     const em = String(u.email || '').toLowerCase().trim();
-    if (!em) return;
-    if (em === 'gsalinas@pjportland.com' || em === 'garfiohook@gmail.com') return;
-    if (emailsVistos.has(em)) return;
+    if (!em || emailsIgnorados.has(em) || emailsVistos.has(em)) return;
     emailsVistos.add(em);
     todosUsuarios.push(u);
   });
 
   const usuariosDetalle = todosUsuarios.map(u => {
     const emailLower = u.email.toLowerCase();
-    const rol = u.rol;
+    const rol = String(u.rol || 'KEY_USER').trim().toUpperCase();
 
     // Pruebas asignadas al usuario
     let pruebasAsignadas = [];
@@ -4871,14 +5041,16 @@ function renderizarPantallaGestion() {
       pruebasAsignadas = [...cuList.map(c => c.id), ...e2eList.map(e => e.codigo)];
       etiquetaAmbito = '320 pruebas (Líder)';
     } else if (rol === 'EQUIPO_PROYECTO') {
+      const e2eAsig = e2eList.map(e => e.codigo);
       const modulosUser = (u.modulos || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
-      if (modulosUser.length > 0) {
-        pruebasAsignadas = cuList.filter(c => modulosUser.includes(String(c.modulo).toUpperCase())).map(c => c.id);
-        etiquetaAmbito = `${pruebasAsignadas.length} CU (${modulosUser.join(', ')})`;
+      let cuAsig = [];
+      if (modulosUser.length > 0 && !modulosUser.includes('TODOS')) {
+        cuAsig = cuList.filter(c => modulosUser.includes(String(c.modulo).toUpperCase())).map(c => c.id);
       } else {
-        pruebasAsignadas = cuList.map(c => c.id);
-        etiquetaAmbito = '296 Casos CU';
+        cuAsig = cuList.map(c => c.id);
       }
+      pruebasAsignadas = [...e2eAsig, ...cuAsig];
+      etiquetaAmbito = `${e2eAsig.length} E2E + ${cuAsig.length} CU`;
     } else {
       // KEY_USER
       const e2eAsig = e2eList.filter(e => (e.areas || []).some(area => usuarioPerteneceAArea(emailLower, area))).map(e => e.codigo);
@@ -4899,8 +5071,8 @@ function renderizarPantallaGestion() {
     // Reportes del usuario
     const reportesUser = todosLosReportes.filter(r => String(r.email).toLowerCase() === emailLower);
     const cantReportesTotales = reportesUser.length;
-    const cantAsignadas = reportesUser.filter(r => r.alcance === 'ASIGNADA').length;
-    const cantApoyo = reportesUser.filter(r => r.alcance === 'APOYO').length;
+    const cantAsignadas = reportesUser.filter(r => r.alcance === 'ASIGNADA' || pruebasAsignadas.includes(r.objeto)).length;
+    const cantApoyo = reportesUser.filter(r => r.alcance === 'APOYO' || (!pruebasAsignadas.includes(r.objeto) && r.alcance !== 'ASIGNADA')).length;
 
     // Cobertura calculada estrictamente sobre las pruebas asignadas
     const objetosReportados = new Set(reportesUser.map(r => r.objeto));
@@ -4939,8 +5111,8 @@ function renderizarPantallaGestion() {
   // Filtrado de la tabla de usuarios
   const usuariosFiltrados = usuariosDetalle.filter(u => {
     if (AppState.filtroGestionArea === 'TI') {
-      const dep = (u.departamento || '').toUpperCase();
-      const esDeTI = u.rol === 'EQUIPO_PROYECTO' || u.rol === 'LIDER' || dep.includes('TI');
+      const dep = (u.departamento || u['departamento origen'] || '').toUpperCase();
+      const esDeTI = u.rol === 'EQUIPO_PROYECTO' || u.rol === 'LIDER' || dep.includes('TI') || dep.includes('PROYECTO');
       if (!esDeTI) return false;
     } else if (AppState.filtroGestionArea !== 'todas') {
       if (u.rol === 'EQUIPO_PROYECTO' || u.rol === 'LIDER') return false;
@@ -4955,8 +5127,9 @@ function renderizarPantallaGestion() {
     }
     return true;
   }).sort((a, b) => {
-    if (a.cantReportesTotales === 0 && b.cantReportesTotales > 0) return -1;
-    if (a.cantReportesTotales > 0 && b.cantReportesTotales === 0) return 1;
+    if (a.cantReportesTotales > 0 && b.cantReportesTotales === 0) return -1;
+    if (a.cantReportesTotales === 0 && b.cantReportesTotales > 0) return 1;
+    if (b.cantReportesTotales !== a.cantReportesTotales) return b.cantReportesTotales - a.cantReportesTotales;
     return a.nombre.localeCompare(b.nombre);
   });
 
@@ -4968,7 +5141,7 @@ function renderizarPantallaGestion() {
           <div>
             <h1 style="font-size: 18px; font-weight: 700; color: var(--color-bloque-cu);">Panel de Gestion y Productividad</h1>
             <div style="font-size: 12px; color: var(--texto-secundario); margin-top: 2px;">
-              Seguimiento ejecutivo por modulo, area y avance individual de ejecutores · Exclusivo Gabriel Salinas
+              Seguimiento ejecutivo por módulo, área y avance individual de ejecutores · Equipo de Liderazgo
             </div>
           </div>
           <div style="display: flex; align-items: center; gap: 8px;">
@@ -4999,7 +5172,7 @@ function renderizarPantallaGestion() {
         <div class="tarjeta-kpi">
           <div class="tarjeta-kpi-titulo">Total Ejecutores</div>
           <div class="tarjeta-kpi-valor">${totalKeyUsers}</div>
-          <div class="tarjeta-kpi-detalle">49 Key-Users + 4 TI / Proyecto</div>
+          <div class="tarjeta-kpi-detalle">${todosUsuarios.filter(u => u.rol === 'KEY_USER').length} Key-Users + ${usuariosTI.length} TI / Proyecto</div>
         </div>
 
         <div class="tarjeta-kpi">
@@ -5151,7 +5324,7 @@ function renderizarPantallaGestion() {
                     <span style="color: ${a.usersSinReportes > 0 ? '#991b1b; font-weight: 700;' : '#64748b;'}">${a.usersSinReportes}</span>
                   </td>
                   <td>
-                    <button class="btn-secundario btn-filtrar-area-gestion" data-area="${a.key}" style="padding: 3px 8px; font-size: 11px;">
+                    <button class="btn-secundario btn-filtrar-area-gestion" data-area="${a.filtroAreaKey || a.key}" style="padding: 3px 8px; font-size: 11px;">
                       Ver usuarios
                     </button>
                   </td>
@@ -5179,7 +5352,7 @@ function renderizarPantallaGestion() {
             <div>
               <select id="sel-gestion-area" class="form-select" style="font-size: 12px; height: 32px;">
                 <option value="todas" ${AppState.filtroGestionArea === 'todas' ? 'selected' : ''}>Todas las áreas y TI (${totalKeyUsers} ejecutores)</option>
-                <option value="TI" ${AppState.filtroGestionArea === 'TI' ? 'selected' : ''}>TI / Equipo de Proyecto (${usuariosTI.length + 1} personas)</option>
+                <option value="TI" ${AppState.filtroGestionArea === 'TI' ? 'selected' : ''}>TI / Equipo de Proyecto (${usuariosTI.length} personas)</option>
                 ${areas.map(a => `
                   <option value="${a.key}" ${AppState.filtroGestionArea === a.key ? 'selected' : ''}>${a.key}</option>
                 `).join('')}
@@ -5356,7 +5529,7 @@ function enlazarEventosVistaGestion() {
     }
     mostrarToast('Sincronizando con Google Sheets...');
     try {
-      await sincronizarEstadoServidor();
+      await sincronizarEstadoServidor({ forzar: true });
       renderizarApp();
       const cant = AppState.resultadosVigentes.size;
       mostrarToast(`Sincronización completada: ${cant} pruebas registradas.`);
@@ -5444,7 +5617,7 @@ function obtenerDatosCertificado() {
 
   let usuarioObj = null;
   if (!esConsolidadoTodos) {
-    usuarioObj = LISTA_USUARIOS_SIMULADOS.find(u => (u.email || '').toLowerCase() === emailBuscado);
+    usuarioObj = obtenerListaUsuarios().find(u => (u.email || '').toLowerCase() === emailBuscado);
     if (!usuarioObj && AppState.sesion && AppState.sesion.perfil && (AppState.sesion.perfil.email || '').toLowerCase() === emailBuscado) {
       usuarioObj = AppState.sesion.perfil;
     }
@@ -5633,7 +5806,7 @@ function renderizarPantallaCertificado() {
                   📋 Consolidado General (Todos los ejecutores)
                 </option>
                 <optgroup label="Key-Users y Equipo de Certificación">
-                  ${LISTA_USUARIOS_SIMULADOS.filter(u => u.email !== AppState.sesion.perfil.email).map(u => `
+                  ${obtenerListaUsuarios().filter(u => u.email !== AppState.sesion.perfil.email).map(u => `
                     <option value="${u.email}" ${f.usuarioEmail === u.email ? 'selected' : ''}>
                       ${u.nombre} (${u.email}) [${u.sociedad || 'CL11'}]
                     </option>
